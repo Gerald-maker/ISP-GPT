@@ -3,6 +3,8 @@
 # ----------------------------------------
 FROM python:3.11-slim-bookworm
 
+LABEL space.rebuild="final-fix-2025-10-22"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
   PYTHONUNBUFFERED=1 \
   PIP_NO_CACHE_DIR=1 \
@@ -15,27 +17,28 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   PORT=7860 \
   PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu"
 
-# System deps (no wget, no git)
+# ✅ Minimal system dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
   tini curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
+# ✅ Create non-root user
 RUN useradd -m -u 1000 appuser
 WORKDIR /app
 
-# Python deps
+# ✅ Install dependencies
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
   && pip install --no-cache-dir -r requirements.txt
 
-# Project files
+# ✅ Copy app files
 COPY . .
 
-# Persistent dirs & permissions
+# ✅ Prepare /data directories
 RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus \
   && chown -R appuser:appuser /data /app
 
-# Optional: start script permissions
+# ✅ Optional: make bootstrap.sh executable if it exists
 RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi
 
 USER appuser
@@ -45,5 +48,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
 
 ENTRYPOINT ["/usr/bin/tini","--"]
-# CMD ["bash","bootstrap.sh"]
 CMD ["python","app.py"]
