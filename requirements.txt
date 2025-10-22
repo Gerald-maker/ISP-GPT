@@ -1,39 +1,33 @@
+# Force CPU-only PyTorch wheels
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # --- API ---
 fastapi==0.114.2
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
 
-# --- LangChain + vector store ---
-# Align all LC packages on 0.3.x (core <0.4.0)
+# --- LangChain + vector store (aligned) ---
 langchain==0.3.7
 langchain-community==0.3.7
 langchain-text-splitters==0.3.2
 langchain-chroma==0.1.4
 chromadb>=0.5.6,<0.6.0
-langchain-huggingface==0.1.2   # needs langchain-core >=0.3.15,<0.4.0
+langchain-huggingface==0.1.2
 
-# --- Embeddings / HF (BGE path) ---
-transformers>=4.42,<5
-torch==2.3.1                   # CPU wheel works on Spaces
-huggingface-hub>=0.23,<0.26
-numpy==1.26.4                  # safe with torch 2.3.1
+# --- Embeddings / HF ---
+transformers>=4.46,<5
+torch==2.3.1         # CPU build will be used because of the extra-index line above
+huggingface-hub<0.26,>=0.23
+numpy==1.26.4
 
-# --- Ingest helpers (your loaders) ---
+# --- Ingest helpers ---
 tqdm>=4.66
 Unidecode>=1.3
-pymupdf>=1.24                  # PyMuPDFLoader (pip name: pymupdf)
-beautifulsoup4>=4.12           # BSHTMLLoader
+pymupdf>=1.24
+beautifulsoup4>=4.12
 lxml>=5.1
 docx2txt>=0.8
-pandas>=2.2,<3                 # CSVLoader uses pandas
+pandas<3,>=2.2
 
-# --- Optional (choose ONE small embedder if you want) ---
-# fastembed==0.3.1             # tiny & fast; if you set EMBED_PROVIDER=fastembed
-
-# --- Optional extras you can keep/remove ---
-# rank-bm25
-# sse-starlette
-# slowapi
-# pypdf
-# unstructured                  # heavy: only add if you actually use it
-# langchain-ollama==0.1.0       # if EMBED_PROVIDER=ollama or you use Ollama LLMs
+# --- Optional ---
+# fastembed==0.3.1
