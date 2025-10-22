@@ -16,8 +16,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   PORT=7860
 
 # ---- System deps ----
+# Add wget and tar to avoid "command not found" errors in scripts/layers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  tini curl ca-certificates \
+  tini curl wget tar ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 # ---- Create a non-root user (safer) ----
