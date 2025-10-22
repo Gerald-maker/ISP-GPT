@@ -3,10 +3,14 @@
 # ----------------------------------------
 FROM python:3.11-slim-bookworm
 
+# (Optional) bump this to force a fresh rebuild on HF when needed
+LABEL build.cachebuster="2025-10-22-01"
+
 # ---- Core env (persistent paths + defaults) ----
 ENV PYTHONDONTWRITEBYTECODE=1 \
   PYTHONUNBUFFERED=1 \
   PIP_NO_CACHE_DIR=1 \
+  PIP_DISABLE_PIP_VERSION_CHECK=1 \
   HF_HOME=/data/.huggingface \
   RAG_DB_DIR=/data/chroma_db \
   RAG_CORPUS_DIR=/data/corpus \
@@ -24,9 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---- Create a non-root user (safer) ----
 RUN useradd -m -u 1000 appuser
 
+# ---- Workdir ----
 WORKDIR /app
 
-# ---- Python deps ----
+# ---- Python deps (copy first to leverage cache) ----
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
   && pip install --no-cache-dir -r requirements.txt
@@ -34,9 +39,9 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # ---- Project files ----
 COPY . .
 
-# ---- Make persistent dirs & relax permissions (Space mounts /data) ----
+# ---- Persistent dirs & permissions (/data is mounted by Spaces) ----
 RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus \
-  && chown -R appuser:appuser /data /app
+  && chown -r appuser:appuser /data /app || chown -R appuser:appuser /data /app
 
 # If you use a start script, ensure it's executable (optional)
 RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi
