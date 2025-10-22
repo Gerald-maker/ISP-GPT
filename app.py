@@ -5,13 +5,22 @@
 Career GPT RAG API — FastAPI over Chroma + Embeddings + HuggingFace Inference LLM
 Optimized for Hugging Face Spaces deployment.
 
-Key points for Spaces:
-- DB_DIR persists under /data/chroma_db  (enable Persistent storage in Space settings)
-- PORT comes from $PORT (injected by Spaces), or falls back to RAG_PORT / 7860
-- LLM uses Hugging Face Inference API (set secret: HUGGINGFACEHUB_API_TOKEN)
+Enhancements in this version:
+- Pull PDFs from a Hugging Face DATASET repo into /data/corpus (persistent storage)
+- Auto-(re)index Chroma when the dataset commit SHA changes
+- /refresh endpoint to force re-pull + reindex without redeploying
+
+Space requirements:
+- Enable Persistent storage in Space settings
+- Set env (optional defaults shown below):
+    RAG_DATASET_ID=internationalscholarsprogram/DOC
+    RAG_DATASET_REVISION=main
+    RAG_DB_DIR=/data/chroma_db
+    RAG_CORPUS_DIR=/data/corpus
+- Add to requirements.txt: huggingface_hub, pypdf, langchain (or your version)
 """
 
-import os, sys, logging, warnings
+import os, sys, logging, warnings, json, shutil
 from typing import List, Optional, Iterable, Dict, Any
 
 # -------------------- Quiet warnings --------------------
@@ -47,7 +56,7 @@ try:
 except ImportError:
     from langchain_community.llms import HuggingFaceEndpoint  # fallback
 
-# Prefer BGE or FastEmbed (no sklearn/scipy). Fall back to HF Embeddings if available.
+# Embeddings
 from langchain_community.embeddings import (
     HuggingFaceBgeEmbeddings,
     FastEmbedEmbeddings,
@@ -55,23 +64,27 @@ from langchain_community.embeddings import (
 try:
     from langchain_huggingface import HuggingFaceEmbeddings as HFEmbeddings  # optional
 except ImportError:
-    HFEmbeddings = None  # not strictly needed
+    HFEmbeddings = None
 
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 try:
     from langchain_core.runnables import RunnableParallel
 except ImportError:
-    # Very old LC versions: we can run without Parallel wiring
     RunnableParallel = None
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings  # modern base
 
+# NEW: dataset + PDF loading helpers
+from huggingface_hub import snapshot_download, get_repo_info
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 # -------------------- Config --------------------
 ENV = os.getenv
-DB_DIR = ENV("RAG_DB_DIR", "/data/chroma_db")       # persistent volume in Spaces
-EMBED_PROVIDER = ENV("RAG_EMBED_PROVIDER", "bge").lower()  # bge | fastembed | hf_local
+DB_DIR = ENV("RAG_DB_DIR", "/data/chroma_db")               # persistent Chroma dir
+EMBED_PROVIDER = ENV("RAG_EMBED_PROVIDER", "bge").lower()   # bge | fastembed | hf_local
 EMBED_MODEL = ENV("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 DEVICE = ENV("RAG_DEVICE", "cpu")
 HF_TOKEN = ENV("HUGGINGFACEHUB_API_TOKEN", "")
@@ -88,10 +101,16 @@ FALLBACK_MSG = ENV(
     "I am Career GPT for International Scholars Program and I’m still under training. "
     "I hope I’ll keep learning and improve my responses next time."
 )
-API_KEY = ENV("RAG_API_KEY")                        # optional bearer key for /ask
+API_KEY = ENV("RAG_API_KEY")                                # optional bearer key for /ask
 HOST = ENV("RAG_HOST", "0.0.0.0")
-PORT = int(ENV("PORT", ENV("RAG_PORT", "7860")))    # <-- Spaces $PORT first
+PORT = int(ENV("PORT", ENV("RAG_PORT", "7860")))            # Spaces $PORT first
 CORS_ORIGINS = ENV("RAG_CORS_ORIGINS", "*")
+
+# NEW: dataset sync locations
+DATASET_ID   = ENV("RAG_DATASET_ID", "internationalscholarsprogram/DOC")
+DATA_REV     = ENV("RAG_DATASET_REVISION", "main")          # tag/branch/sha, or "main"
+CORPUS_DIR   = ENV("RAG_CORPUS_DIR", "/data/corpus")        # where PDFs are downloaded
+STATE_FILE   = ENV("RAG_STATE_FILE", "/data/.state.json")   # remembers last indexed commit
 
 # -------------------- Embeddings --------------------
 def batched(iterable: Iterable, n: int):
@@ -123,9 +142,7 @@ class BGEAdapter(Embeddings):
 def build_embeddings(provider: str, model: str, device: str,
                      use_prefixes: bool, hf_token: str, batch_size: int) -> Embeddings:
     provider = (provider or "").lower()
-    # Preferred: BGE (no scipy/sklearn) — fast & reliable on Spaces CPU
     if provider in ("bge", "hf_bge", "bge_small"):
-        log.info(f"Embedding provider: BGE ({model}) on {device}")
         base = HuggingFaceBgeEmbeddings(
             model_name=model,
             model_kwargs={"device": device},
@@ -133,24 +150,17 @@ def build_embeddings(provider: str, model: str, device: str,
         )
         return BGEAdapter(base, use_prefixes=use_prefixes)
 
-    # Option: FastEmbed (tiny, very fast)
     if provider in ("fastembed", "fe"):
-        log.info("Embedding provider: FastEmbed")
         return FastEmbedEmbeddings()
 
-    # Fallback: classic HF Embeddings (may pull sklearn/scipy via sentence-transformers)
     if HFEmbeddings is not None and provider in ("hf_local", "hf", "sentence_transformers", ""):
-        log.info(f"Embedding provider: HF local ({model}) on {device}")
         base = HFEmbeddings(
             model_name=model,
             model_kwargs={"device": device},
             encode_kwargs={"normalize_embeddings": True},
         )
-        # BGEAdapter is harmless even for non-BGE models if use_prefixes=False
         return BGEAdapter(base, use_prefixes=("bge" in model.lower() and use_prefixes))
 
-    # Last resort: FastEmbed
-    log.warning(f"Unknown EMBED_PROVIDER '{provider}', defaulting to FastEmbed.")
     return FastEmbedEmbeddings()
 
 embeddings = build_embeddings(
@@ -162,10 +172,8 @@ embeddings = build_embeddings(
     batch_size=EMBED_BATCH,
 )
 
-# -------------------- Vector DB / Retriever --------------------
-# Ensure the persistent dir exists (first boot in Space)
+# -------------------- Vector DB handle (created now; filled later) --------------------
 os.makedirs(DB_DIR, exist_ok=True)
-
 vectordb = Chroma(
     persist_directory=DB_DIR,
     embedding_function=embeddings,
@@ -203,9 +211,99 @@ prompt = ChatPromptTemplate.from_template(
     "Answer concisely and include source tags like [1], [2] where relevant."
 )
 
-# Runnable wiring: pass exactly the keys the prompt expects.
 parser = StrOutputParser()
 chain = (prompt | llm | parser)
+
+# -------------------- Dataset sync & indexing --------------------
+def _state_load() -> dict:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _state_save(st: dict):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(st, f)
+
+def sync_pdfs(revision: str = DATA_REV) -> str:
+    """
+    Pull/update PDFs from the HF dataset into CORPUS_DIR and return the exact commit sha.
+    Uses ETag-aware snapshot_download → only changed files are fetched.
+    """
+    os.makedirs(CORPUS_DIR, exist_ok=True)
+    snapshot_download(
+        repo_id=DATASET_ID,
+        repo_type="dataset",
+        revision=revision,
+        local_dir=CORPUS_DIR,
+        local_dir_use_symlinks=False,
+    )
+    info = get_repo_info(DATASET_ID, repo_type="dataset", revision=revision)
+    return info.sha
+
+def list_pdf_paths(root: str) -> List[str]:
+    out: List[str] = []
+    for r, _, files in os.walk(root):
+        for f in files:
+            if f.lower().endswith(".pdf"):
+                out.append(os.path.join(r, f))
+    return sorted(out)
+
+def load_docs_from_pdfs(pdf_paths: List[str]) -> List[Document]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1200, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+    )
+    docs: List[Document] = []
+    for path in pdf_paths:
+        try:
+            loader = PyPDFLoader(path)
+            pages = loader.load()
+            chunks = splitter.split_documents(pages)
+            for c in chunks:
+                c.metadata.setdefault("source", path)
+            docs.extend(chunks)
+        except Exception as e:
+            log.error(f"Failed to parse {path}: {e}")
+    return docs
+
+def _reset_chroma_dir():
+    # safest reset: delete the dir and recreate
+    if os.path.isdir(DB_DIR):
+        shutil.rmtree(DB_DIR)
+    os.makedirs(DB_DIR, exist_ok=True)
+
+def rebuild_chroma(docs: List[Document]):
+    global vectordb
+    _reset_chroma_dir()
+    vectordb = Chroma(
+        persist_directory=DB_DIR,
+        embedding_function=embeddings,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+    if docs:
+        vectordb.add_documents(docs)
+        vectordb.persist()
+
+def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str, Any]:
+    """
+    Pull dataset → compare commit sha → rebuild index if changed or forced.
+    """
+    new_sha = sync_pdfs(revision)
+    st = _state_load()
+    old_sha = st.get("dataset_sha")
+
+    if force or (new_sha != old_sha) or (not os.path.isdir(DB_DIR)):
+        pdfs = list_pdf_paths(CORPUS_DIR)
+        docs = load_docs_from_pdfs(pdfs)
+        rebuild_chroma(docs)
+        st["dataset_sha"] = new_sha
+        _state_save(st)
+        return {"reindexed": True, "commit": new_sha, "docs": len(docs)}
+    return {"reindexed": False, "commit": new_sha}
 
 # -------------------- Helpers --------------------
 def format_docs(docs: List[Document]) -> str:
@@ -248,7 +346,7 @@ def answer_question(question: str, k: int = TOP_K_DEFAULT) -> Dict[str, Any]:
     return {"answer": answer, "citations": cits, "used_k": k}
 
 # -------------------- FastAPI --------------------
-app = FastAPI(title="Career GPT RAG API", version="1.0.1")
+app = FastAPI(title="Career GPT RAG API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
@@ -275,18 +373,35 @@ class AskResponse(BaseModel):
     citations: list
     used_k: int
 
+# ---- Startup: sync + (re)index if dataset changed ----
+try:
+    info = reindex_if_needed(force=False, revision=DATA_REV)
+    log.info(f"Index warmup → {info}")
+except Exception as e:
+    log.exception("Initial sync/index failed")
+
 @app.get("/healthz")
 def healthz():
     try:
-        meta = vectordb.get(include=["metadatas"], limit=1)
+        # Best-effort count
+        count = 0
+        try:
+            count = vectordb._collection.count()  # type: ignore[attr-defined]
+        except Exception:
+            meta = vectordb.get(limit=1)
+            count = len(meta.get("ids", []))
+        st = _state_load()
         return {
             "status": "ok",
             "db_dir": DB_DIR,
-            "docs_indexed": len(meta.get("ids", [])),
+            "docs_indexed": count,
             "embed_provider": EMBED_PROVIDER,
             "embed_model": EMBED_MODEL,
             "llm": HF_LLM_REPO,
             "hf_token_present": bool(HF_TOKEN),
+            "dataset": DATASET_ID,
+            "dataset_rev": DATA_REV,
+            "dataset_sha_indexed": st.get("dataset_sha"),
         }
     except Exception as e:
         log.exception("Health check failed")
@@ -307,6 +422,19 @@ def ask(req: AskRequest, _ok: bool = Depends(require_api_key)):
         raise
     except Exception as e:
         log.exception("Unhandled /ask error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---- NEW: manual refresh endpoint ----
+@app.post("/refresh")
+def refresh(_ok: bool = Depends(require_api_key)):
+    """
+    Force re-pull dataset + rebuild index (use right after pushing new PDFs).
+    """
+    try:
+        info = reindex_if_needed(force=True, revision=DATA_REV)
+        return {"status": "ok", **info}
+    except Exception as e:
+        log.exception("/refresh failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------- Runner --------------------
