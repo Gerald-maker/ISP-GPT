@@ -4,18 +4,19 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 
 # --- LangChain + vector store ---
-langchain==0.2.16
-langchain-community==0.2.16
+# Align all LC packages on 0.3.x (core <0.4.0)
+langchain==0.3.7
+langchain-community==0.3.7
+langchain-text-splitters==0.3.2
 langchain-chroma==0.1.4
-langchain-text-splitters==0.2.2
 chromadb>=0.5.6,<0.6.0
-langchain-huggingface==0.1.2   # for HuggingFaceEndpoint LLM
+langchain-huggingface==0.1.2   # needs langchain-core >=0.3.15,<0.4.0
 
 # --- Embeddings / HF (BGE path) ---
 transformers>=4.42,<5
 torch==2.3.1                   # CPU wheel works on Spaces
 huggingface-hub>=0.23,<0.26
-numpy>=1.26.4,<3
+numpy==1.26.4                  # safe with torch 2.3.1
 
 # --- Ingest helpers (your loaders) ---
 tqdm>=4.66
