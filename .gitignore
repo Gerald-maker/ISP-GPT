@@ -1,0 +1,12 @@
+﻿chroma_db/
+data/
+*.sqlite3
+*.bin
+*.npy
+*.npz
+.huggingface/
+.cache/
+*.pdf
+*.docx
+*.pptx
+*.zip
