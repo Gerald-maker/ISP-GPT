@@ -17,14 +17,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   RAG_PORT=7860 \
   PORT=7860
 
+# --- Quiet CPU/GPU noise and telemetry ---
+ENV CUDA_VISIBLE_DEVICES="" \
+  OMP_NUM_THREADS=1 \
+  CHROMADB_TELEMETRY="false" \
+  ANONYMIZED_TELEMETRY="false" \
+  HF_HUB_DISABLE_TELEMETRY=1
+
 # --- System dependencies ---
 # Add `git` so Dev Mode's git config steps don't fail
 RUN apt-get update && apt-get install -y --no-install-recommends \
   tini wget curl ca-certificates tar git \
   && rm -rf /var/lib/apt/lists/*
 
-# --- Non-root user ---
-RUN useradd -m -u 1000 appuser
+# --- Non-root user (kept for reference) ---
+RUN useradd -m -u 1000 appuser || true
 
 WORKDIR /app
 
@@ -36,14 +43,16 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # --- Project files ---
 COPY . .
 
-# --- Persistent directories & permissions ---
-RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus \
-  && chown -R appuser:appuser /data /app
+# --- Persistent directories ---
+RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus
 
 # --- Optional: bootstrap script permissions ---
 RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi
 
-USER appuser
+# ⚠️ Run as root so /data (mounted volume) stays writable in HF Spaces Dev Mode
+# (Running as appuser causes sqlite3.OperationalError: readonly database)
+# USER appuser
+
 EXPOSE 7860
 
 # --- Healthcheck ---
