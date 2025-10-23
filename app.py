@@ -13,11 +13,10 @@ Enhancements in this version:
 - UPDATED: Chroma migration to new client API (PersistentClient)
 """
 
-import os, sys, logging, warnings, json, shutil, time
+import os, sys, logging, warnings, json, shutil, time, sqlite3
 from typing import List, Optional, Iterable, Dict, Any
 
 # -------------------- Quiet warnings & env hygiene --------------------
-# Silence common warnings
 if not sys.warnoptions:
     warnings.simplefilter("ignore")
 for cat in (DeprecationWarning, UserWarning, FutureWarning):
@@ -35,9 +34,8 @@ if _omp:
     except Exception:
         os.environ["OMP_NUM_THREADS"] = "1"
 
-# Optionally quiet ONNX Runtime if present
-os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")  # WARN
-# Disable accidental GPU probing on CPU Spaces (harmless if GPU exists)
+# Quiet ONNX + disable GPU probing on CPU Spaces
+os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 logging.basicConfig(
@@ -94,8 +92,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # -------------------- Config --------------------
 ENV = os.getenv
-DB_DIR = ENV("RAG_DB_DIR", "/data/chroma_db")               # intended Chroma dir
-COLLECTION_NAME = ENV("RAG_COLLECTION", "career_gpt")       # NEW: explicit collection name
+DB_DIR = ENV("RAG_DB_DIR", "/tmp/chroma_db")                # /tmp is always writable on Spaces
+COLLECTION_NAME = ENV("RAG_COLLECTION", "career_gpt")       # explicit collection name
 
 EMBED_PROVIDER = ENV("RAG_EMBED_PROVIDER", "bge").lower()   # bge | fastembed | hf_local
 EMBED_MODEL = ENV("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
@@ -308,37 +306,50 @@ def load_docs_from_pdfs(pdf_paths: List[str]) -> List[Document]:
     return docs
 
 def _reset_chroma_dir():
-    """Safely reset the Chroma persist dir even if a client is holding files."""
-    # Try to drop the collection cleanly
+    """Prefer deleting the collection via client; avoid deleting files on disk to prevent RO issues."""
     try:
-        # Delete collection if it exists
-        try:
-            _chroma_client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
+        _chroma_client.delete_collection(COLLECTION_NAME)
     except Exception:
         pass
-
-    # Ensure on-disk dir is clean (client keeps metadata separately)
-    for _ in range(10):
-        try:
-            if os.path.isdir(DB_DIR):
-                shutil.rmtree(DB_DIR)
-            break
-        except OSError:
-            time.sleep(0.2)
-    os.makedirs(DB_DIR, exist_ok=True)
+    # Do NOT rmtree() the directory here; some mounts flip to read-only or fail on unlink.
 
 def _open_vectordb():
-    """(Re)create a vectordb handle bound to the persistent client."""
-    global vectordb, _chroma_client
-    _chroma_client = PersistentClient(path=DB_DIR)
-    vectordb = Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=embeddings,
-        client=_chroma_client,
-        collection_metadata={"hnsw:space": "cosine"},
-    )
+    """
+    (Re)create a vectordb handle bound to a persistent client.
+    Falls back to /tmp if the current path is read-only.
+    """
+    global vectordb, _chroma_client, DB_DIR
+
+    def _make_client(path: str):
+        os.makedirs(path, exist_ok=True)
+        return PersistentClient(path=path)
+
+    try:
+        _chroma_client = _make_client(DB_DIR)
+        vectordb = Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=embeddings,
+            client=_chroma_client,
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+        # Touch the collection to ensure underlying store is writable
+        _ = vectordb._collection.count()
+    except (sqlite3.OperationalError, PermissionError):
+        # Typical case: "sqlite3.OperationalError: attempt to write a readonly database"
+        fallback = "/tmp/chroma_db"
+        if DB_DIR != fallback:
+            DB_DIR = fallback
+            os.makedirs(DB_DIR, exist_ok=True)
+            _chroma_client = _make_client(DB_DIR)
+            vectordb = Chroma(
+                collection_name=COLLECTION_NAME,
+                embedding_function=embeddings,
+                client=_chroma_client,
+                collection_metadata={"hnsw:space": "cosine"},
+            )
+        else:
+            # If even /tmp fails, bubble up
+            raise
 
 def rebuild_chroma(docs: List[Document]):
     _reset_chroma_dir()
@@ -348,7 +359,7 @@ def rebuild_chroma(docs: List[Document]):
         batch = 64
         for i in range(0, len(docs), batch):
             vectordb.add_documents(docs[i:i+batch])
-        # No explicit persist() call needed; PersistentClient is, well, persistent.
+    # No explicit persist() call needed; PersistentClient is persistent
 
 def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str, Any]:
     """
@@ -373,7 +384,6 @@ def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str
 
 # -------------------- Helpers --------------------
 def format_docs(docs: List[Document]) -> str:
-
     parts = []
     for i, d in enumerate(docs, 1):
         src = d.metadata.get("source", "unknown")
@@ -453,7 +463,6 @@ def healthz():
         # Best-effort count
         count = 0
         try:
-            # Internal attribute may exist; keep as soft attempt
             count = getattr(vectordb, "_collection", None).count()  # type: ignore[call-arg, attr-defined]
         except Exception:
             meta = vectordb.get(limit=1)
