@@ -10,19 +10,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   PIP_ROOT_USER_ACTION=ignore \
   PIP_DISABLE_PIP_VERSION_CHECK=1 \
   HF_HOME=/data/.huggingface \
-  RAG_DB_DIR=/data/chroma_db \
+  RAG_DB_DIR=/tmp/chroma_db \ 
   RAG_CORPUS_DIR=/data/corpus \
   RAG_DATASET_ID=internationalscholarsprogram/DOC \
   RAG_DATASET_REVISION=main \
   RAG_PORT=7860 \
-  PORT=7860
+  PORT=7860 \
+  TOKENIZERS_PARALLELISM=false
 
-# --- Quiet CPU/GPU noise and telemetry ---
-ENV CUDA_VISIBLE_DEVICES="" \
-  OMP_NUM_THREADS=1 \
-  CHROMADB_TELEMETRY="false" \
-  ANONYMIZED_TELEMETRY="false" \
-  HF_HUB_DISABLE_TELEMETRY=1
 
 # --- System dependencies ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -42,14 +37,14 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # --- Project files ---
 COPY . .
 
-# --- Persistent directories ---
-RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus \
-  && chmod -R 777 /data /app
+# --- Persistent / writable directories ---
+RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus /tmp/chroma_db \
+  && chmod -R 777 /data /app /tmp
 
 # --- Optional: bootstrap script permissions ---
 RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi
 
-# ⚠️ Do NOT switch user; root keeps /data writable in HF Spaces
+# ⚠️ Do NOT switch user; root keeps /data and /tmp writable in HF Spaces
 # USER appuser
 
 EXPOSE 7860
