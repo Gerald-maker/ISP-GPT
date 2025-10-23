@@ -10,14 +10,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   PIP_ROOT_USER_ACTION=ignore \
   PIP_DISABLE_PIP_VERSION_CHECK=1 \
   HF_HOME=/data/.huggingface \
-  RAG_DB_DIR=/tmp/chroma_db \ 
+  RAG_DB_DIR=/tmp/chroma_db \
   RAG_CORPUS_DIR=/data/corpus \
   RAG_DATASET_ID=internationalscholarsprogram/DOC \
   RAG_DATASET_REVISION=main \
   RAG_PORT=7860 \
   PORT=7860 \
-  TOKENIZERS_PARALLELISM=false
-
+  TOKENIZERS_PARALLELISM=false \
+  CHROMA_DB_IMPL=duckdb+parquet \
+  CHROMADB_TELEMETRY=false \
+  ANONYMIZED_TELEMETRY=false \
+  HF_HUB_DISABLE_TELEMETRY=1 \
+  CUDA_VISIBLE_DEVICES="" \
+  OMP_NUM_THREADS=1
 
 # --- System dependencies ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -44,7 +49,7 @@ RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus /tmp/chroma_db \
 # --- Optional: bootstrap script permissions ---
 RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi
 
-# ⚠️ Do NOT switch user; root keeps /data and /tmp writable in HF Spaces
+# Do NOT switch user; keep root so /data and /tmp are writable in Spaces
 # USER appuser
 
 EXPOSE 7860

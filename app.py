@@ -9,15 +9,7 @@ Enhancements in this version:
 - Pull PDFs from a Hugging Face DATASET repo into /data/corpus (persistent storage)
 - Auto-(re)index Chroma when the dataset commit SHA changes
 - /refresh endpoint to force re-pull + reindex without redeploying
-
-Space requirements:
-- Enable Persistent storage in Space settings
-- Set env (optional defaults shown below):
-    RAG_DATASET_ID=internationalscholarsprogram/DOC
-    RAG_DATASET_REVISION=main
-    RAG_DB_DIR=/data/chroma_db
-    RAG_CORPUS_DIR=/data/corpus
-- Add to requirements.txt: huggingface_hub, pypdf, langchain (or your version)
+- SAFE writable dir detection for Chroma with fallback to /tmp/chroma_db
 """
 
 import os, sys, logging, warnings, json, shutil, time
@@ -81,9 +73,12 @@ from huggingface_hub import snapshot_download, HfApi
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+# NEW: explicit Chroma settings (prevents telemetry + ensures persistence)
+from chromadb.config import Settings
+
 # -------------------- Config --------------------
 ENV = os.getenv
-DB_DIR = ENV("RAG_DB_DIR", "/data/chroma_db")               # persistent Chroma dir
+DB_DIR = ENV("RAG_DB_DIR", "/data/chroma_db")               # intended Chroma dir
 EMBED_PROVIDER = ENV("RAG_EMBED_PROVIDER", "bge").lower()   # bge | fastembed | hf_local
 EMBED_MODEL = ENV("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 DEVICE = ENV("RAG_DEVICE", "cpu")
@@ -111,6 +106,23 @@ DATASET_ID   = ENV("RAG_DATASET_ID", "internationalscholarsprogram/DOC")
 DATA_REV     = ENV("RAG_DATASET_REVISION", "main")          # tag/branch/sha, or "main"
 CORPUS_DIR   = ENV("RAG_CORPUS_DIR", "/data/corpus")        # where PDFs are downloaded
 STATE_FILE   = ENV("RAG_STATE_FILE", "/data/.state.json")   # remembers last indexed commit
+
+# -------------------- Ensure writable DB dir (with /tmp fallback) --------------------
+def _ensure_writable_dir(path: str) -> str:
+    try:
+        os.makedirs(path, exist_ok=True)
+        testfile = os.path.join(path, ".write_test")
+        with open(testfile, "w") as f:
+            f.write("ok")
+        os.remove(testfile)
+        return path
+    except Exception as e:
+        fallback = "/tmp/chroma_db"
+        os.makedirs(fallback, exist_ok=True)
+        log.warning(f"{path} not writable ({e}); falling back to {fallback}")
+        return fallback
+
+DB_DIR = _ensure_writable_dir(DB_DIR)
 
 # -------------------- Embeddings --------------------
 def batched(iterable: Iterable, n: int):
@@ -174,10 +186,16 @@ embeddings = build_embeddings(
 
 # -------------------- Vector DB handle (created now; filled later) --------------------
 os.makedirs(DB_DIR, exist_ok=True)
+client_settings = Settings(
+    anonymized_telemetry=False,
+    is_persistent=True,
+    persist_directory=DB_DIR,
+)
 vectordb = Chroma(
     persist_directory=DB_DIR,
     embedding_function=embeddings,
-    collection_metadata={"hnsw:space": "cosine"}
+    collection_metadata={"hnsw:space": "cosine"},
+    client_settings=client_settings,
 )
 
 def build_retriever(k: int):
@@ -302,11 +320,12 @@ def _reset_chroma_dir():
 def rebuild_chroma(docs: List[Document]):
     global vectordb
     _reset_chroma_dir()
-    # Recreate a fresh store
+    # Recreate a fresh store (use the same client_settings)
     vectordb = Chroma(
         persist_directory=DB_DIR,
         embedding_function=embeddings,
         collection_metadata={"hnsw:space": "cosine"},
+        client_settings=client_settings,
     )
     if docs:
         # Add in small batches to keep memory low
@@ -376,7 +395,7 @@ def answer_question(question: str, k: int = TOP_K_DEFAULT) -> Dict[str, Any]:
 app = FastAPI(title="Career GPT RAG API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip() ],
+    allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
