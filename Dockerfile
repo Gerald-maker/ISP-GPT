@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   PIP_ROOT_USER_ACTION=ignore \
   PIP_DISABLE_PIP_VERSION_CHECK=1 \
   HF_HOME=/data/.huggingface \
-  RAG_DB_DIR=/data/chroma_db \
+  RAG_DB_DIR=/tmp/chroma_db \
   RAG_CORPUS_DIR=/data/corpus \
   RAG_DATASET_ID=internationalscholarsprogram/DOC \
   RAG_DATASET_REVISION=main \
@@ -23,8 +23,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   ORT_LOG_SEVERITY_LEVEL=3
 
 # NOTE:
-# - Removed legacy Chroma envs (CHROMA_DB_IMPL, CHROMADB_TELEMETRY, ANONYMIZED_TELEMETRY)
-#   since the new PersistentClient doesn’t use them.
+# - Legacy Chroma envs (CHROMA_DB_IMPL, CHROMADB_TELEMETRY, ANONYMIZED_TELEMETRY) removed.
+# - /tmp is used for Chroma to avoid read-only filesystem issues on Spaces.
 
 # --- System dependencies ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -45,8 +45,8 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 COPY . .
 
 # --- Persistent / writable directories ---
-RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus /tmp/chroma_db \
-  && chmod -R 777 /data /app /tmp
+RUN mkdir -p /tmp/chroma_db /data/.huggingface /data/corpus \
+  && chmod -R 777 /tmp /data /app
 
 # Do NOT switch user; keep root so /data and /tmp are writable in Spaces
 # USER appuser
