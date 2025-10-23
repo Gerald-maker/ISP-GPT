@@ -77,7 +77,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings  # modern base
 
 # NEW: dataset + PDF loading helpers
-from huggingface_hub import snapshot_download, get_repo_info
+from huggingface_hub import snapshot_download, HfApi   # <-- fixed import
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -242,7 +242,9 @@ def sync_pdfs(revision: str = DATA_REV) -> str:
         local_dir=CORPUS_DIR,
         local_dir_use_symlinks=False,
     )
-    info = get_repo_info(DATASET_ID, repo_type="dataset", revision=revision)
+    # --- fixed: use HfApi().repo_info instead of removed get_repo_info ---
+    api = HfApi()
+    info = api.repo_info(repo_id=DATASET_ID, repo_type="dataset", revision=revision)
     return info.sha
 
 def list_pdf_paths(root: str) -> List[str]:
@@ -349,7 +351,7 @@ def answer_question(question: str, k: int = TOP_K_DEFAULT) -> Dict[str, Any]:
 app = FastAPI(title="Career GPT RAG API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
+    allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip() ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
