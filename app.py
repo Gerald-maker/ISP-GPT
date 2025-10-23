@@ -1,521 +1,134 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Career GPT RAG API — FastAPI over Chroma + Embeddings + HuggingFace Inference LLM
-Optimized for Hugging Face Spaces deployment.
-
-Enhancements in this version:
-- Pull PDFs from a Hugging Face DATASET repo into /data/corpus (persistent storage)
-- Auto-(re)index Chroma when the dataset commit SHA changes
-- /refresh endpoint to force re-pull + reindex without redeploying
-- SAFE writable dir detection for Chroma with fallback to /tmp/chroma_db
-- UPDATED: Chroma migration to new client API (PersistentClient)
-"""
-
-import os, sys, logging, warnings, json, shutil, time, sqlite3
-from typing import List, Optional, Iterable, Dict, Any
-
-# -------------------- Quiet warnings & env hygiene --------------------
-if not sys.warnoptions:
-    warnings.simplefilter("ignore")
-for cat in (DeprecationWarning, UserWarning, FutureWarning):
-    warnings.filterwarnings("ignore", category=cat)
-warnings.filterwarnings("ignore", message=".*LangChainDeprecationWarning.*")
-os.environ.setdefault("PYTHONWARNINGS", "ignore")
-
-# Sanitize OMP_NUM_THREADS (fixes: "libgomp: Invalid value for OMP_NUM_THREADS")
-_omp = os.environ.get("OMP_NUM_THREADS")
-if _omp:
-    try:
-        n = int(str(_omp).strip())
-        if n <= 0:
-            raise ValueError
-    except Exception:
-        os.environ["OMP_NUM_THREADS"] = "1"
-
-# Quiet ONNX + disable GPU probing on CPU Spaces
-os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-
-logging.basicConfig(
-    level=logging.ERROR,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-log = logging.getLogger("rag_api")
-for _noisy in ["httpx", "chromadb", "uvicorn", "langchain", "asyncio"]:
-    logging.getLogger(_noisy).setLevel(logging.ERROR)
-
-# -------------------- Imports --------------------
+import os, threading, logging, warnings, sys, json, sqlite3, shutil, time
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-# Vector store (new Chroma client API)
-try:
-    from langchain_chroma import Chroma
-except ImportError:
-    from langchain_community.vectorstores import Chroma  # fallback
-
-from chromadb import PersistentClient  # NEW: explicit client
-
-# LLM endpoint
-try:
-    from langchain_huggingface import HuggingFaceEndpoint
-except ImportError:
-    from langchain_community.llms import HuggingFaceEndpoint  # fallback
-
-# Embeddings
-from langchain_community.embeddings import (
-    HuggingFaceBgeEmbeddings,
-    FastEmbedEmbeddings,
-)
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings as HFEmbeddings  # optional
-except ImportError:
-    HFEmbeddings = None
-
+from huggingface_hub import snapshot_download, HfApi
+from langchain_chroma import Chroma
+from chromadb import PersistentClient
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings, FastEmbedEmbeddings
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-try:
-    from langchain_core.runnables import RunnableParallel
-except ImportError:
-    RunnableParallel = None
-
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings  # modern base
-
-# Dataset + PDF loading helpers
-from huggingface_hub import snapshot_download, HfApi
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_huggingface import HuggingFaceEndpoint
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
 
-# -------------------- Config --------------------
+warnings.filterwarnings("ignore")
+os.environ["ORT_LOG_SEVERITY_LEVEL"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+log = logging.getLogger("rag_api")
+logging.basicConfig(level=logging.INFO)
+
+# --- Env ---
 ENV = os.getenv
-DB_DIR = ENV("RAG_DB_DIR", "/tmp/chroma_db")                # /tmp is always writable on Spaces
-COLLECTION_NAME = ENV("RAG_COLLECTION", "career_gpt")       # explicit collection name
+DB_DIR = ENV("RAG_DB_DIR", "/tmp/chroma_db")
+COLLECTION_NAME = ENV("RAG_COLLECTION", "career_gpt")
+DATASET_ID = ENV("RAG_DATASET_ID", "internationalscholarsprogram/DOC")
+DATA_REV = ENV("RAG_DATASET_REVISION", "main")
+CORPUS_DIR = ENV("RAG_CORPUS_DIR", "/data/corpus")
+STATE_FILE = "/data/.state.json"
+PORT = int(ENV("PORT", "7860"))
+HOST = "0.0.0.0"
 
-EMBED_PROVIDER = ENV("RAG_EMBED_PROVIDER", "bge").lower()   # bge | fastembed | hf_local
-EMBED_MODEL = ENV("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
-DEVICE = ENV("RAG_DEVICE", "cpu")
-HF_TOKEN = ENV("HUGGINGFACEHUB_API_TOKEN", "")
-USE_PREFIX = ENV("RAG_BGE_PREFIX", "1") not in ("0", "false", "False")
-EMBED_BATCH = int(ENV("RAG_EMBED_BATCH", "32"))
-TOP_K_DEFAULT = int(ENV("RAG_TOP_K", "4"))
-FETCH_K = int(ENV("RAG_FETCH_K", str(max(TOP_K_DEFAULT * 3, 12))))
-LAMBDA_MMR = float(ENV("RAG_LAMBDA", "0.5"))
-NUM_CTX = int(ENV("RAG_NUM_CTX", "8192"))
-NUM_PREDICT = int(ENV("RAG_NUM_PREDICT", "512"))
-TEMPERATURE = float(ENV("RAG_TEMPERATURE", "0.2"))
-FALLBACK_MSG = ENV(
-    "RAG_FALLBACK_MSG",
-    "I am Career GPT for International Scholars Program and I’m still under training. "
-    "I hope I’ll keep learning and improve my responses next time."
-)
-API_KEY = ENV("RAG_API_KEY")                                # optional bearer key for /ask
-HOST = ENV("RAG_HOST", "0.0.0.0")
-PORT = int(ENV("PORT", ENV("RAG_PORT", "7860")))            # Spaces $PORT first
-CORS_ORIGINS = ENV("RAG_CORS_ORIGINS", "*")
-
-# Dataset sync locations
-DATASET_ID   = ENV("RAG_DATASET_ID", "internationalscholarsprogram/DOC")
-DATA_REV     = ENV("RAG_DATASET_REVISION", "main")          # tag/branch/sha, or "main"
-CORPUS_DIR   = ENV("RAG_CORPUS_DIR", "/data/corpus")        # where PDFs are downloaded
-STATE_FILE   = ENV("RAG_STATE_FILE", "/data/.state.json")   # remembers last indexed commit
-
-# -------------------- Ensure writable DB dir (with /tmp fallback) --------------------
-def _ensure_writable_dir(path: str) -> str:
-    try:
-        os.makedirs(path, exist_ok=True)
-        testfile = os.path.join(path, ".write_test")
-        with open(testfile, "w") as f:
-            f.write("ok")
-        os.remove(testfile)
-        return path
-    except Exception as e:
-        fallback = "/tmp/chroma_db"
-        os.makedirs(fallback, exist_ok=True)
-        log.warning(f"{path} not writable ({e}); falling back to {fallback}")
-        return fallback
-
-DB_DIR = _ensure_writable_dir(DB_DIR)
-
-# -------------------- Embeddings --------------------
-def batched(iterable: Iterable, n: int):
-    b = []
-    for x in iterable:
-        b.append(x)
-        if len(b) >= n:
-            yield b
-            b = []
-    if b:
-        yield b
-
-class BGEAdapter(Embeddings):
-    """Add 'passage:' and 'query:' prefixes (BGE best practice)."""
-    def __init__(self, base: Embeddings, use_prefixes: bool = True):
-        self.base = base
-        self.use_prefixes = use_prefixes
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        if self.use_prefixes:
-            texts = [f"passage: {t}" for t in texts]
-        return self.base.embed_documents(texts)
-
-    def embed_query(self, text: str) -> List[float]:
-        if self.use_prefixes:
-            text = f"query: {text}"
-        return self.base.embed_query(text)
-
-def build_embeddings(provider: str, model: str, device: str,
-                     use_prefixes: bool, hf_token: str, batch_size: int) -> Embeddings:
-    provider = (provider or "").lower()
-    if provider in ("bge", "hf_bge", "bge_small"):
-        base = HuggingFaceBgeEmbeddings(
-            model_name=model,
-            model_kwargs={"device": device},
-            encode_kwargs={'normalize_embeddings': True},
-        )
-        return BGEAdapter(base, use_prefixes=use_prefixes)
-
-    if provider in ("fastembed", "fe"):
-        return FastEmbedEmbeddings()
-
-    if HFEmbeddings is not None and provider in ("hf_local", "hf", "sentence_transformers", ""):
-        base = HFEmbeddings(
-            model_name=model,
-            model_kwargs={"device": device},
-            encode_kwargs={'normalize_embeddings': True},
-        )
-        return BGEAdapter(base, use_prefixes=("bge" in model.lower() and use_prefixes))
-
-    return FastEmbedEmbeddings()
-
-embeddings = build_embeddings(
-    provider=EMBED_PROVIDER,
-    model=EMBED_MODEL,
-    device=DEVICE,
-    use_prefixes=USE_PREFIX,
-    hf_token=HF_TOKEN,
-    batch_size=EMBED_BATCH,
-)
-
-# -------------------- Vector DB handle (new Chroma client) --------------------
+# --- Embeddings + Vector DB ---
+embeddings = HuggingFaceBgeEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 os.makedirs(DB_DIR, exist_ok=True)
+client = PersistentClient(path=DB_DIR)
+vectordb = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=client)
 
-# Create a persistent Chroma **client** (NEW API)
-_chroma_client = PersistentClient(path=DB_DIR)
+def build_retriever(k:int=4): return vectordb.as_retriever(search_type="mmr")
 
-# Create/open the collection via LangChain's wrapper
-vectordb = Chroma(
-    collection_name=COLLECTION_NAME,
-    embedding_function=embeddings,
-    client=_chroma_client,
-    collection_metadata={"hnsw:space": "cosine"},
-)
-
-def build_retriever(k: int):
-    return vectordb.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": k, "fetch_k": FETCH_K, "lambda_mult": LAMBDA_MMR}
-    )
-
-# -------------------- LLM (Hugging Face Inference) --------------------
-HF_LLM_REPO = ENV("HF_LLM_REPO", "mistralai/Mistral-7B-Instruct-v0.3")
-
-if not HF_TOKEN:
-    log.warning("HUGGINGFACEHUB_API_TOKEN is not set; /ask will fail until you add the secret.")
-
+# --- LLM ---
+HF_TOKEN = ENV("HUGGINGFACEHUB_API_TOKEN","")
 llm = HuggingFaceEndpoint(
-    repo_id=HF_LLM_REPO,
+    repo_id="mistralai/Mistral-7B-Instruct-v0.3",
     task="text-generation",
-    max_new_tokens=NUM_PREDICT,
-    temperature=TEMPERATURE,
-    timeout=120,
     huggingfacehub_api_token=HF_TOKEN,
-)
-
-SYSTEM_RULES = (
-    "You are a careful RAG assistant for the International Scholars Program.\n"
-    "Use only the information inside <context> to answer.\n"
-    "If the answer is not fully supported by the context, say exactly: \"I don’t know.\""
+    max_new_tokens=512,
+    temperature=0.2
 )
 prompt = ChatPromptTemplate.from_template(
-    f"{SYSTEM_RULES}\n\n<question>\n{{question}}\n</question>\n\n<context>\n{{context}}\n</context>\n\n"
-    "Answer concisely and include source tags like [1], [2] where relevant."
+    "Use <context> to answer. If not sure, say 'I don’t know.'\n\nQ: {question}\n<context>\n{context}\n</context>"
 )
+chain = prompt | llm | StrOutputParser()
 
-parser = StrOutputParser()
-chain = (prompt | llm | parser)
-
-# -------------------- Dataset sync & indexing --------------------
-def _state_load() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def _state_save(st: dict):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(st, f)
-
-def sync_pdfs(revision: str = DATA_REV) -> str:
-    """
-    Pull/update PDFs from the HF dataset into CORPUS_DIR and return the exact commit sha.
-    Uses ETag-aware snapshot_download → only changed files are fetched.
-    """
+def sync_pdfs() -> str:
     os.makedirs(CORPUS_DIR, exist_ok=True)
-    snapshot_download(
-        repo_id=DATASET_ID,
-        repo_type="dataset",
-        revision=revision,
-        local_dir=CORPUS_DIR,
-        local_dir_use_symlinks=False,
-    )
-    api = HfApi()
-    info = api.repo_info(repo_id=DATASET_ID, repo_type="dataset", revision=revision)
+    snapshot_download(repo_id=DATASET_ID, repo_type="dataset",
+                      revision=DATA_REV, local_dir=CORPUS_DIR, local_dir_use_symlinks=False)
+    info = HfApi().repo_info(repo_id=DATASET_ID, repo_type="dataset", revision=DATA_REV)
     return info.sha
 
-def list_pdf_paths(root: str) -> List[str]:
-    out: List[str] = []
-    for r, _, files in os.walk(root):
-        for f in files:
-            if f.lower().endswith(".pdf"):
-                out.append(os.path.join(r, f))
-    return sorted(out)
-
-def load_docs_from_pdfs(pdf_paths: List[str]) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
-    )
-    docs: List[Document] = []
-    for path in pdf_paths:
-        try:
-            loader = PyPDFLoader(path)
-            pages = loader.load()
-            chunks = splitter.split_documents(pages)
-            for c in chunks:
-                c.metadata.setdefault("source", path)
-            docs.extend(chunks)
-        except Exception as e:
-            log.error(f"Failed to parse {path}: {e}")
+def list_pdfs(root): return [os.path.join(r,f) for r,_,fs in os.walk(root) for f in fs if f.lower().endswith(".pdf")]
+def load_docs(paths): 
+    docs=[]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
+    for p in paths:
+        for pg in PyPDFLoader(p).load(): docs+=splitter.split_documents([pg])
     return docs
 
-def _reset_chroma_dir():
-    """Prefer deleting the collection via client; avoid deleting files on disk to prevent RO issues."""
-    try:
-        _chroma_client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-    # Do NOT rmtree() the directory here; some mounts flip to read-only or fail on unlink.
+def rebuild_index(docs):
+    try: client.delete_collection(COLLECTION_NAME)
+    except: pass
+    new_client = PersistentClient(path=DB_DIR)
+    new_db = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=new_client)
+    for i in range(0,len(docs),32): new_db.add_documents(docs[i:i+32])
+    return new_db
 
-def _open_vectordb():
-    """
-    (Re)create a vectordb handle bound to a persistent client.
-    Falls back to /tmp if the current path is read-only.
-    """
-    global vectordb, _chroma_client, DB_DIR
+def reindex(force=False):
+    os.makedirs(CORPUS_DIR,exist_ok=True)
+    new_sha = sync_pdfs()
+    old_sha = json.load(open(STATE_FILE))["dataset_sha"] if os.path.exists(STATE_FILE) else None
+    if force or new_sha!=old_sha:
+        pdfs=list_pdfs(CORPUS_DIR)
+        docs=load_docs(pdfs)
+        global vectordb; vectordb=rebuild_index(docs)
+        json.dump({"dataset_sha":new_sha}, open(STATE_FILE,"w"))
+        return {"reindexed":True,"commit":new_sha,"docs":len(docs)}
+    return {"reindexed":False,"commit":new_sha}
 
-    def _make_client(path: str):
-        os.makedirs(path, exist_ok=True)
-        return PersistentClient(path=path)
-
-    try:
-        _chroma_client = _make_client(DB_DIR)
-        vectordb = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=embeddings,
-            client=_chroma_client,
-            collection_metadata={"hnsw:space": "cosine"},
-        )
-        # Touch the collection to ensure underlying store is writable
-        _ = vectordb._collection.count()
-    except (sqlite3.OperationalError, PermissionError):
-        # Typical case: "sqlite3.OperationalError: attempt to write a readonly database"
-        fallback = "/tmp/chroma_db"
-        if DB_DIR != fallback:
-            DB_DIR = fallback
-            os.makedirs(DB_DIR, exist_ok=True)
-            _chroma_client = _make_client(DB_DIR)
-            vectordb = Chroma(
-                collection_name=COLLECTION_NAME,
-                embedding_function=embeddings,
-                client=_chroma_client,
-                collection_metadata={"hnsw:space": "cosine"},
-            )
-        else:
-            # If even /tmp fails, bubble up
-            raise
-
-def rebuild_chroma(docs: List[Document]):
-    _reset_chroma_dir()
-    _open_vectordb()
-    if docs:
-        # Add in small batches to keep memory low
-        batch = 64
-        for i in range(0, len(docs), batch):
-            vectordb.add_documents(docs[i:i+batch])
-    # No explicit persist() call needed; PersistentClient is persistent
-
-def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str, Any]:
-    """
-    Pull dataset → compare commit sha → rebuild index if changed or forced.
-    """
-    new_sha = sync_pdfs(revision)
-    st = _state_load()
-    old_sha = st.get("dataset_sha")
-
-    needs_rebuild = force or (new_sha != old_sha)
-    if needs_rebuild:
-        pdfs = list_pdf_paths(CORPUS_DIR)
-        docs = load_docs_from_pdfs(pdfs)
-        rebuild_chroma(docs)
-        st["dataset_sha"] = new_sha
-        _state_save(st)
-        return {"reindexed": True, "commit": new_sha, "docs": len(docs)}
-    else:
-        # Ensure handle is open even if no rebuild was needed
-        _open_vectordb()
-        return {"reindexed": False, "commit": new_sha}
-
-# -------------------- Helpers --------------------
-def format_docs(docs: List[Document]) -> str:
-    parts = []
-    for i, d in enumerate(docs, 1):
-        src = d.metadata.get("source", "unknown")
-        page = d.metadata.get("page")
-        tag = f"[{i}] ({src}" + (f", p.{page}" if page is not None else "") + ")"
-        parts.append(f"{tag}\n{d.page_content}")
-    return "\n\n".join(parts)
-
-def fallback_msg() -> str:
-    return FALLBACK_MSG
-
-def normalize_unknown(answer: str) -> str:
-    lowered = answer.strip().lower()
-    for p in [
-        "i don't know", "i do not know", "not in the context",
-        "cannot find", "unsure", "no context"
-    ]:
-        if p in lowered:
-            return fallback_msg()
-    return answer
-
-def answer_question(question: str, k: int = TOP_K_DEFAULT) -> Dict[str, Any]:
-    docs = build_retriever(k).invoke(question)
-    if not docs:
-        return {"answer": fallback_msg(), "citations": [], "used_k": k}
-    context = format_docs(docs)
-    try:
-        raw = chain.invoke({"question": question, "context": context})
-        answer = normalize_unknown(raw)
-    except Exception as e:
-        log.exception("LLM error")
-        raise HTTPException(status_code=500, detail=f"LLM error: {e}")
-    cits = [{"index": i,
-             "source": d.metadata.get("source", "unknown"),
-             "page": d.metadata.get("page")}
-            for i, d in enumerate(docs, 1)]
-    return {"answer": answer, "citations": cits, "used_k": k}
-
-# -------------------- FastAPI --------------------
-app = FastAPI(title="Career GPT RAG API", version="1.2.0")
+# --- FastAPI ---
+app = FastAPI(title="Career GPT RAG API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def require_api_key(authorization: Optional[str] = Header(None)):
-    if API_KEY:
-        if not authorization or not authorization.lower().startswith("bearer "):
-            raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-        token = authorization.split(" ", 1)[1].strip()
-        if token != API_KEY:
-            raise HTTPException(status_code=403, detail="Invalid API key")
-    return True
+INDEX_STATUS={"state":"idle","detail":"","last_commit":None}
 
-class AskRequest(BaseModel):
-    question: str = Field(..., min_length=2)
-    top_k: Optional[int] = Field(None, ge=1, le=20)
-
-class AskResponse(BaseModel):
-    answer: str
-    citations: list
-    used_k: int
-
-# ---- Startup: sync + (re)index if dataset changed ----
-try:
-    info = reindex_if_needed(force=False, revision=DATA_REV)
-    log.info(f"Index warmup → {info}")
-except Exception as e:
-    log.exception("Initial sync/index failed")
-
-@app.get("/healthz")
-def healthz():
+def warmup():
+    global INDEX_STATUS
     try:
-        # Best-effort count
-        count = 0
-        try:
-            count = getattr(vectordb, "_collection", None).count()  # type: ignore[call-arg, attr-defined]
-        except Exception:
-            meta = vectordb.get(limit=1)
-            count = len(meta.get("ids", []))
-        st = _state_load()
-        return {
-            "status": "ok",
-            "db_dir": DB_DIR,
-            "collection": COLLECTION_NAME,
-            "docs_indexed_estimate": count,
-            "embed_provider": EMBED_PROVIDER,
-            "embed_model": EMBED_MODEL,
-            "llm": HF_LLM_REPO,
-            "hf_token_present": bool(HF_TOKEN),
-            "dataset": DATASET_ID,
-            "dataset_rev": DATA_REV,
-            "dataset_sha_indexed": st.get("dataset_sha"),
-        }
+        INDEX_STATUS.update({"state":"syncing","detail":"starting"})
+        info=reindex(force=False)
+        INDEX_STATUS.update({"state":"ready","detail":str(info),"last_commit":info.get("commit")})
+        log.info(f"Index ready {info}")
     except Exception as e:
-        log.exception("Health check failed")
-        raise HTTPException(status_code=500, detail=f"Health check failed: {e}")
+        INDEX_STATUS.update({"state":"error","detail":str(e)})
+        log.error(e)
+
+@app.on_event("startup")
+def _startup(): threading.Thread(target=warmup,daemon=True).start()
 
 @app.get("/health")
-def health():
-    return healthz()
+def health(): return {"status":"ok","index_status":INDEX_STATUS}
 
-@app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest, _ok: bool = Depends(require_api_key)):
-    k = req.top_k or TOP_K_DEFAULT
-    if not HF_TOKEN:
-        raise HTTPException(status_code=503, detail="Hugging Face token not configured.")
-    try:
-        return AskResponse(**answer_question(req.question, k=k))
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("Unhandled /ask error")
-        raise HTTPException(status_code=500, detail=str(e))
+class Ask(BaseModel): question:str
+@app.post("/ask")
+def ask(q:Ask):
+    docs=build_retriever(4).invoke(q.question)
+    ctx="\n\n".join([d.page_content for d in docs])
+    try: return {"answer":chain.invoke({"question":q.question,"context":ctx})}
+    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
 
-# ---- Manual refresh endpoint ----
-@app.post("/refresh")
-def refresh(_ok: bool = Depends(require_api_key)):
-    """
-    Force re-pull dataset + rebuild index (use right after pushing new PDFs).
-    """
-    try:
-        info = reindex_if_needed(force=True, revision=DATA_REV)
-        return {"status": "ok", **info}
-    except Exception as e:
-        log.exception("/refresh failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -------------------- Runner --------------------
-if __name__ == "__main__":
+if __name__=="__main__":
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn.run(app,host=HOST,port=PORT)
