@@ -1,0 +1,62 @@
+[1mdiff --git a/Dockerfile b/Dockerfile[m
+[1mindex b16398c..659aa4c 100644[m
+[1m--- a/Dockerfile[m
+[1m+++ b/Dockerfile[m
+[36m@@ -3,8 +3,6 @@[m
+ # ----------------------------------------[m
+ FROM python:3.11-slim-bookworm[m
+ [m
+[31m-LABEL space.rebuild="final-fix-2025-10-22"[m
+[31m-[m
+ ENV PYTHONDONTWRITEBYTECODE=1 \[m
+   PYTHONUNBUFFERED=1 \[m
+   PIP_NO_CACHE_DIR=1 \[m
+[36m@@ -14,31 +12,31 @@[m [mENV PYTHONDONTWRITEBYTECODE=1 \[m
+   RAG_DATASET_ID=internationalscholarsprogram/DOC \[m
+   RAG_DATASET_REVISION=main \[m
+   RAG_PORT=7860 \[m
+[31m-  PORT=7860 \[m
+[31m-  PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu"[m
+[32m+[m[32m  PORT=7860[m
+ [m
+[31m-# ✅ Minimal system dependencies only[m
+[32m+[m[32m# System deps (no git, no wget needed)[m
+ RUN apt-get update && apt-get install -y --no-install-recommends \[m
+   tini curl ca-certificates \[m
+   && rm -rf /var/lib/apt/lists/*[m
+ [m
+[31m-# ✅ Create non-root user[m
+[32m+[m[32m# Non-root user[m
+ RUN useradd -m -u 1000 appuser[m
+[32m+[m
+ WORKDIR /app[m
+ [m
+[31m-# ✅ Install dependencies[m
+[32m+[m[32m# Python deps[m
+ COPY requirements.txt .[m
+ RUN python -m pip install --upgrade pip setuptools wheel \[m
+   && pip install --no-cache-dir -r requirements.txt[m
+ [m
+[31m-# ✅ Copy app files[m
+[32m+[m[32m# Project files[m
+ COPY . .[m
+ [m
+[31m-# ✅ Prepare /data directories[m
+[32m+[m[32m# Persistent dirs & permissions[m
+ RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus \[m
+   && chown -R appuser:appuser /data /app[m
+ [m
+[31m-# ✅ Optional: make bootstrap.sh executable if it exists[m
+[32m+[m[32m# Optional start script perms[m
+ RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi[m
+ [m
+ USER appuser[m
+[36m@@ -47,5 +45,6 @@[m [mEXPOSE 7860[m
+ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \[m
+   CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1[m
+ [m
+[31m-ENTRYPOINT ["/usr/bin/tini","--"][m
+[31m-CMD ["python","app.py"][m
+[32m+[m[32mENTRYPOINT ["/usr/bin/tini", "--"][m
+[32m+[m[32m# CMD ["bash", "bootstrap.sh"][m
+[32m+[m[32mCMD ["python", "app.py"][m

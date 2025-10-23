@@ -10,18 +10,35 @@ Enhancements in this version:
 - Auto-(re)index Chroma when the dataset commit SHA changes
 - /refresh endpoint to force re-pull + reindex without redeploying
 - SAFE writable dir detection for Chroma with fallback to /tmp/chroma_db
+- UPDATED: Chroma migration to new client API (PersistentClient)
 """
 
 import os, sys, logging, warnings, json, shutil, time
 from typing import List, Optional, Iterable, Dict, Any
 
-# -------------------- Quiet warnings --------------------
+# -------------------- Quiet warnings & env hygiene --------------------
+# Silence common warnings
 if not sys.warnoptions:
     warnings.simplefilter("ignore")
 for cat in (DeprecationWarning, UserWarning, FutureWarning):
     warnings.filterwarnings("ignore", category=cat)
 warnings.filterwarnings("ignore", message=".*LangChainDeprecationWarning.*")
 os.environ.setdefault("PYTHONWARNINGS", "ignore")
+
+# Sanitize OMP_NUM_THREADS (fixes: "libgomp: Invalid value for OMP_NUM_THREADS")
+_omp = os.environ.get("OMP_NUM_THREADS")
+if _omp:
+    try:
+        n = int(str(_omp).strip())
+        if n <= 0:
+            raise ValueError
+    except Exception:
+        os.environ["OMP_NUM_THREADS"] = "1"
+
+# Optionally quiet ONNX Runtime if present
+os.environ.setdefault("ORT_LOG_SEVERITY_LEVEL", "3")  # WARN
+# Disable accidental GPU probing on CPU Spaces (harmless if GPU exists)
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 logging.basicConfig(
     level=logging.ERROR,
@@ -36,11 +53,13 @@ from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Vector store
+# Vector store (new Chroma client API)
 try:
     from langchain_chroma import Chroma
 except ImportError:
     from langchain_community.vectorstores import Chroma  # fallback
+
+from chromadb import PersistentClient  # NEW: explicit client
 
 # LLM endpoint
 try:
@@ -68,17 +87,16 @@ except ImportError:
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings  # modern base
 
-# NEW: dataset + PDF loading helpers
+# Dataset + PDF loading helpers
 from huggingface_hub import snapshot_download, HfApi
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# NEW: explicit Chroma settings (prevents telemetry + ensures persistence)
-from chromadb.config import Settings
-
 # -------------------- Config --------------------
 ENV = os.getenv
 DB_DIR = ENV("RAG_DB_DIR", "/data/chroma_db")               # intended Chroma dir
+COLLECTION_NAME = ENV("RAG_COLLECTION", "career_gpt")       # NEW: explicit collection name
+
 EMBED_PROVIDER = ENV("RAG_EMBED_PROVIDER", "bge").lower()   # bge | fastembed | hf_local
 EMBED_MODEL = ENV("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 DEVICE = ENV("RAG_DEVICE", "cpu")
@@ -101,7 +119,7 @@ HOST = ENV("RAG_HOST", "0.0.0.0")
 PORT = int(ENV("PORT", ENV("RAG_PORT", "7860")))            # Spaces $PORT first
 CORS_ORIGINS = ENV("RAG_CORS_ORIGINS", "*")
 
-# NEW: dataset sync locations
+# Dataset sync locations
 DATASET_ID   = ENV("RAG_DATASET_ID", "internationalscholarsprogram/DOC")
 DATA_REV     = ENV("RAG_DATASET_REVISION", "main")          # tag/branch/sha, or "main"
 CORPUS_DIR   = ENV("RAG_CORPUS_DIR", "/data/corpus")        # where PDFs are downloaded
@@ -158,7 +176,7 @@ def build_embeddings(provider: str, model: str, device: str,
         base = HuggingFaceBgeEmbeddings(
             model_name=model,
             model_kwargs={"device": device},
-            encode_kwargs={"normalize_embeddings": True},
+            encode_kwargs={'normalize_embeddings': True},
         )
         return BGEAdapter(base, use_prefixes=use_prefixes)
 
@@ -169,7 +187,7 @@ def build_embeddings(provider: str, model: str, device: str,
         base = HFEmbeddings(
             model_name=model,
             model_kwargs={"device": device},
-            encode_kwargs={"normalize_embeddings": True},
+            encode_kwargs={'normalize_embeddings': True},
         )
         return BGEAdapter(base, use_prefixes=("bge" in model.lower() and use_prefixes))
 
@@ -184,18 +202,18 @@ embeddings = build_embeddings(
     batch_size=EMBED_BATCH,
 )
 
-# -------------------- Vector DB handle (created now; filled later) --------------------
+# -------------------- Vector DB handle (new Chroma client) --------------------
 os.makedirs(DB_DIR, exist_ok=True)
-client_settings = Settings(
-    anonymized_telemetry=False,
-    is_persistent=True,
-    persist_directory=DB_DIR,
-)
+
+# Create a persistent Chroma **client** (NEW API)
+_chroma_client = PersistentClient(path=DB_DIR)
+
+# Create/open the collection via LangChain's wrapper
 vectordb = Chroma(
-    persist_directory=DB_DIR,
+    collection_name=COLLECTION_NAME,
     embedding_function=embeddings,
+    client=_chroma_client,
     collection_metadata={"hnsw:space": "cosine"},
-    client_settings=client_settings,
 )
 
 def build_retriever(k: int):
@@ -291,48 +309,46 @@ def load_docs_from_pdfs(pdf_paths: List[str]) -> List[Document]:
 
 def _reset_chroma_dir():
     """Safely reset the Chroma persist dir even if a client is holding files."""
-    # Try to tell Chroma to drop collections first (if client exists)
+    # Try to drop the collection cleanly
     try:
-        client = getattr(vectordb, "_client", None)
-        if client is not None:
-            try:
-                client.reset()
-            except Exception:
-                try:
-                    coll = getattr(vectordb, "_collection", None)
-                    if coll and getattr(coll, "name", None):
-                        client.delete_collection(coll.name)
-                except Exception:
-                    pass
+        # Delete collection if it exists
+        try:
+            _chroma_client.delete_collection(COLLECTION_NAME)
+        except Exception:
+            pass
     except Exception:
         pass
 
-    # Retry rmtree a few times in case background handles are slow to release
+    # Ensure on-disk dir is clean (client keeps metadata separately)
     for _ in range(10):
         try:
             if os.path.isdir(DB_DIR):
                 shutil.rmtree(DB_DIR)
             break
         except OSError:
-            time.sleep(0.2)  # brief backoff
+            time.sleep(0.2)
     os.makedirs(DB_DIR, exist_ok=True)
 
-def rebuild_chroma(docs: List[Document]):
-    global vectordb
-    _reset_chroma_dir()
-    # Recreate a fresh store (use the same client_settings)
+def _open_vectordb():
+    """(Re)create a vectordb handle bound to the persistent client."""
+    global vectordb, _chroma_client
+    _chroma_client = PersistentClient(path=DB_DIR)
     vectordb = Chroma(
-        persist_directory=DB_DIR,
+        collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
+        client=_chroma_client,
         collection_metadata={"hnsw:space": "cosine"},
-        client_settings=client_settings,
     )
+
+def rebuild_chroma(docs: List[Document]):
+    _reset_chroma_dir()
+    _open_vectordb()
     if docs:
         # Add in small batches to keep memory low
         batch = 64
         for i in range(0, len(docs), batch):
             vectordb.add_documents(docs[i:i+batch])
-        vectordb.persist()
+        # No explicit persist() call needed; PersistentClient is, well, persistent.
 
 def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str, Any]:
     """
@@ -342,17 +358,21 @@ def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str
     st = _state_load()
     old_sha = st.get("dataset_sha")
 
-    if force or (new_sha != old_sha) or (not os.path.isdir(DB_DIR)):
+    needs_rebuild = force or (new_sha != old_sha)
+    if needs_rebuild:
         pdfs = list_pdf_paths(CORPUS_DIR)
         docs = load_docs_from_pdfs(pdfs)
         rebuild_chroma(docs)
         st["dataset_sha"] = new_sha
         _state_save(st)
         return {"reindexed": True, "commit": new_sha, "docs": len(docs)}
-    return {"reindexed": False, "commit": new_sha}
+    else:
+        # Ensure handle is open even if no rebuild was needed
+        _open_vectordb()
+        return {"reindexed": False, "commit": new_sha}
 
 # -------------------- Helpers --------------------
-def format_docs(docs: List[Document]) -> str:
+def format_docs(docs: List[Document] -> str):
     parts = []
     for i, d in enumerate(docs, 1):
         src = d.metadata.get("source", "unknown")
@@ -392,7 +412,7 @@ def answer_question(question: str, k: int = TOP_K_DEFAULT) -> Dict[str, Any]:
     return {"answer": answer, "citations": cits, "used_k": k}
 
 # -------------------- FastAPI --------------------
-app = FastAPI(title="Career GPT RAG API", version="1.1.0")
+app = FastAPI(title="Career GPT RAG API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
@@ -432,7 +452,8 @@ def healthz():
         # Best-effort count
         count = 0
         try:
-            count = vectordb._collection.count()  # type: ignore[attr-defined]
+            # Internal attribute may exist; keep as soft attempt
+            count = getattr(vectordb, "_collection", None).count()  # type: ignore[call-arg, attr-defined]
         except Exception:
             meta = vectordb.get(limit=1)
             count = len(meta.get("ids", []))
@@ -440,7 +461,8 @@ def healthz():
         return {
             "status": "ok",
             "db_dir": DB_DIR,
-            "docs_indexed": count,
+            "collection": COLLECTION_NAME,
+            "docs_indexed_estimate": count,
             "embed_provider": EMBED_PROVIDER,
             "embed_model": EMBED_MODEL,
             "llm": HF_LLM_REPO,
@@ -470,7 +492,7 @@ def ask(req: AskRequest, _ok: bool = Depends(require_api_key)):
         log.exception("Unhandled /ask error")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---- NEW: manual refresh endpoint ----
+# ---- Manual refresh endpoint ----
 @app.post("/refresh")
 def refresh(_ok: bool = Depends(require_api_key)):
     """
