@@ -25,12 +25,11 @@ ENV CUDA_VISIBLE_DEVICES="" \
   HF_HUB_DISABLE_TELEMETRY=1
 
 # --- System dependencies ---
-# Add `git` so Dev Mode's git config steps don't fail
 RUN apt-get update && apt-get install -y --no-install-recommends \
   tini wget curl ca-certificates tar git \
   && rm -rf /var/lib/apt/lists/*
 
-# --- Non-root user (kept for reference) ---
+# --- Non-root user (kept for reference; not used) ---
 RUN useradd -m -u 1000 appuser || true
 
 WORKDIR /app
@@ -44,13 +43,13 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 COPY . .
 
 # --- Persistent directories ---
-RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus
+RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus \
+  && chmod -R 777 /data /app
 
 # --- Optional: bootstrap script permissions ---
 RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi
 
-# ⚠️ Run as root so /data (mounted volume) stays writable in HF Spaces Dev Mode
-# (Running as appuser causes sqlite3.OperationalError: readonly database)
+# ⚠️ Do NOT switch user; root keeps /data writable in HF Spaces
 # USER appuser
 
 EXPOSE 7860
