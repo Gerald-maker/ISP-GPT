@@ -20,7 +20,7 @@ Space requirements:
 - Add to requirements.txt: huggingface_hub, pypdf, langchain (or your version)
 """
 
-import os, sys, logging, warnings, json, shutil
+import os, sys, logging, warnings, json, shutil, time
 from typing import List, Optional, Iterable, Dict, Any
 
 # -------------------- Quiet warnings --------------------
@@ -77,7 +77,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings  # modern base
 
 # NEW: dataset + PDF loading helpers
-from huggingface_hub import snapshot_download, HfApi   # <-- fixed import
+from huggingface_hub import snapshot_download, HfApi
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -242,7 +242,6 @@ def sync_pdfs(revision: str = DATA_REV) -> str:
         local_dir=CORPUS_DIR,
         local_dir_use_symlinks=False,
     )
-    # --- fixed: use HfApi().repo_info instead of removed get_repo_info ---
     api = HfApi()
     info = api.repo_info(repo_id=DATASET_ID, repo_type="dataset", revision=revision)
     return info.sha
@@ -273,21 +272,47 @@ def load_docs_from_pdfs(pdf_paths: List[str]) -> List[Document]:
     return docs
 
 def _reset_chroma_dir():
-    # safest reset: delete the dir and recreate
-    if os.path.isdir(DB_DIR):
-        shutil.rmtree(DB_DIR)
+    """Safely reset the Chroma persist dir even if a client is holding files."""
+    # Try to tell Chroma to drop collections first (if client exists)
+    try:
+        client = getattr(vectordb, "_client", None)
+        if client is not None:
+            try:
+                client.reset()
+            except Exception:
+                try:
+                    coll = getattr(vectordb, "_collection", None)
+                    if coll and getattr(coll, "name", None):
+                        client.delete_collection(coll.name)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Retry rmtree a few times in case background handles are slow to release
+    for _ in range(10):
+        try:
+            if os.path.isdir(DB_DIR):
+                shutil.rmtree(DB_DIR)
+            break
+        except OSError:
+            time.sleep(0.2)  # brief backoff
     os.makedirs(DB_DIR, exist_ok=True)
 
 def rebuild_chroma(docs: List[Document]):
     global vectordb
     _reset_chroma_dir()
+    # Recreate a fresh store
     vectordb = Chroma(
         persist_directory=DB_DIR,
         embedding_function=embeddings,
         collection_metadata={"hnsw:space": "cosine"},
     )
     if docs:
-        vectordb.add_documents(docs)
+        # Add in small batches to keep memory low
+        batch = 64
+        for i in range(0, len(docs), batch):
+            vectordb.add_documents(docs[i:i+batch])
         vectordb.persist()
 
 def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str, Any]:
