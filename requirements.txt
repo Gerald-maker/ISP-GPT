@@ -1,3 +1,5 @@
+# ----------------------------------------
+# Career GPT RAG API - Requirements
 # Force CPU-only PyTorch wheels
 --extra-index-url https://download.pytorch.org/whl/cpu
 
@@ -16,9 +18,13 @@ langchain-huggingface==0.1.2
 
 # --- Embeddings / HF ---
 transformers>=4.46,<5
-torch==2.3.1         # CPU build will be used because of the extra-index line above
-huggingface-hub<0.26,>=0.23
+torch==2.3.1                    # CPU build via extra-index above
+huggingface-hub>=0.23.1,<0.26
 numpy==1.26.4
+
+# --- Missing/required for your logs ---
+pypdf>=4.2.0                    # fixes "pypdf package not found" parsing PDFs
+onnxruntime>=1.18.0             # CPU runtime for any ONNX ops (no GPU needed)
 
 # --- Ingest helpers ---
 tqdm>=4.66
