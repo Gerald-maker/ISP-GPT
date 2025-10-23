@@ -18,8 +18,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   PORT=7860
 
 # --- System dependencies ---
+# Add `git` so Dev Mode's git config steps don't fail
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  tini wget curl ca-certificates tar \
+  tini wget curl ca-certificates tar git \
   && rm -rf /var/lib/apt/lists/*
 
 # --- Non-root user ---
