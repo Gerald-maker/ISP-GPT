@@ -372,7 +372,8 @@ def reindex_if_needed(force: bool = False, revision: str = DATA_REV) -> Dict[str
         return {"reindexed": False, "commit": new_sha}
 
 # -------------------- Helpers --------------------
-def format_docs(docs: List[Document] -> str):
+def format_docs(docs: List[Document]) -> str:
+
     parts = []
     for i, d in enumerate(docs, 1):
         src = d.metadata.get("source", "unknown")
