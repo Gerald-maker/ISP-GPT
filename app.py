@@ -41,12 +41,13 @@ os.makedirs(DB_DIR, exist_ok=True)
 client = PersistentClient(path=DB_DIR)
 vectordb = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=client)
 
-def build_retriever(k:int=4): return vectordb.as_retriever(search_type="mmr")
+def build_retriever(k:int=4): 
+    return vectordb.as_retriever(search_type="mmr")
 
 # --- LLM ---
 HF_TOKEN = ENV("HUGGINGFACEHUB_API_TOKEN","")
 llm = HuggingFaceEndpoint(
-    repo_id="mistralai/Mistral-7B-Instruct-v0.3",
+    repo_id="HuggingFaceH4/zephyr-7b-beta",   # ← switched from mistralai/Mistral-7B-Instruct-v0.3
     task="text-generation",
     huggingfacehub_api_token=HF_TOKEN,
     max_new_tokens=512,
@@ -59,38 +60,50 @@ chain = prompt | llm | StrOutputParser()
 
 def sync_pdfs() -> str:
     os.makedirs(CORPUS_DIR, exist_ok=True)
-    snapshot_download(repo_id=DATASET_ID, repo_type="dataset",
-                      revision=DATA_REV, local_dir=CORPUS_DIR, local_dir_use_symlinks=False)
+    snapshot_download(
+        repo_id=DATASET_ID,
+        repo_type="dataset",
+        revision=DATA_REV,
+        local_dir=CORPUS_DIR,
+        local_dir_use_symlinks=False
+    )
     info = HfApi().repo_info(repo_id=DATASET_ID, repo_type="dataset", revision=DATA_REV)
     return info.sha
 
-def list_pdfs(root): return [os.path.join(r,f) for r,_,fs in os.walk(root) for f in fs if f.lower().endswith(".pdf")]
+def list_pdfs(root): 
+    return [os.path.join(r,f) for r,_,fs in os.walk(root) for f in fs if f.lower().endswith(".pdf")]
+
 def load_docs(paths): 
     docs=[]
     splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
     for p in paths:
-        for pg in PyPDFLoader(p).load(): docs+=splitter.split_documents([pg])
+        for pg in PyPDFLoader(p).load():
+            docs += splitter.split_documents([pg])
     return docs
 
 def rebuild_index(docs):
-    try: client.delete_collection(COLLECTION_NAME)
-    except: pass
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except:
+        pass
     new_client = PersistentClient(path=DB_DIR)
     new_db = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=new_client)
-    for i in range(0,len(docs),32): new_db.add_documents(docs[i:i+32])
+    for i in range(0, len(docs), 32):
+        new_db.add_documents(docs[i:i+32])
     return new_db
 
 def reindex(force=False):
-    os.makedirs(CORPUS_DIR,exist_ok=True)
+    os.makedirs(CORPUS_DIR, exist_ok=True)
     new_sha = sync_pdfs()
     old_sha = json.load(open(STATE_FILE))["dataset_sha"] if os.path.exists(STATE_FILE) else None
-    if force or new_sha!=old_sha:
-        pdfs=list_pdfs(CORPUS_DIR)
-        docs=load_docs(pdfs)
-        global vectordb; vectordb=rebuild_index(docs)
-        json.dump({"dataset_sha":new_sha}, open(STATE_FILE,"w"))
-        return {"reindexed":True,"commit":new_sha,"docs":len(docs)}
-    return {"reindexed":False,"commit":new_sha}
+    if force or new_sha != old_sha:
+        pdfs = list_pdfs(CORPUS_DIR)
+        docs = load_docs(pdfs)
+        global vectordb
+        vectordb = rebuild_index(docs)
+        json.dump({"dataset_sha": new_sha}, open(STATE_FILE, "w"))
+        return {"reindexed": True, "commit": new_sha, "docs": len(docs)}
+    return {"reindexed": False, "commit": new_sha}
 
 # --- FastAPI ---
 app = FastAPI(title="Career GPT RAG API", version="1.3.0")
@@ -102,33 +115,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-INDEX_STATUS={"state":"idle","detail":"","last_commit":None}
+INDEX_STATUS = {"state": "idle", "detail": "", "last_commit": None}
 
 def warmup():
     global INDEX_STATUS
     try:
-        INDEX_STATUS.update({"state":"syncing","detail":"starting"})
-        info=reindex(force=False)
-        INDEX_STATUS.update({"state":"ready","detail":str(info),"last_commit":info.get("commit")})
+        INDEX_STATUS.update({"state": "syncing", "detail": "starting"})
+        info = reindex(force=False)
+        INDEX_STATUS.update({"state": "ready", "detail": str(info), "last_commit": info.get("commit")})
         log.info(f"Index ready {info}")
     except Exception as e:
-        INDEX_STATUS.update({"state":"error","detail":str(e)})
+        INDEX_STATUS.update({"state": "error", "detail": str(e)})
         log.error(e)
 
 @app.on_event("startup")
-def _startup(): threading.Thread(target=warmup,daemon=True).start()
+def _startup():
+    threading.Thread(target=warmup, daemon=True).start()
 
 @app.get("/health")
-def health(): return {"status":"ok","index_status":INDEX_STATUS}
+def health():
+    return {"status": "ok", "index_status": INDEX_STATUS}
 
-class Ask(BaseModel): question:str
+class Ask(BaseModel):
+    question: str
+
 @app.post("/ask")
-def ask(q:Ask):
-    docs=build_retriever(4).invoke(q.question)
-    ctx="\n\n".join([d.page_content for d in docs])
-    try: return {"answer":chain.invoke({"question":q.question,"context":ctx})}
-    except Exception as e: raise HTTPException(status_code=500,detail=str(e))
+def ask(q: Ask):
+    docs = build_retriever(4).invoke(q.question)
+    ctx = "\n\n".join([d.page_content for d in docs])
+    try:
+        return {"answer": chain.invoke({"question": q.question, "context": ctx})}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app,host=HOST,port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT)
