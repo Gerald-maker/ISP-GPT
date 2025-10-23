@@ -18,7 +18,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
   PORT=7860
 
 # --- System dependencies ---
-# Added wget + tar to prevent 'wget: not found' error
 RUN apt-get update && apt-get install -y --no-install-recommends \
   tini wget curl ca-certificates tar \
   && rm -rf /var/lib/apt/lists/*
@@ -42,16 +41,6 @@ RUN mkdir -p /data/chroma_db /data/.huggingface /data/corpus \
 
 # --- Optional: bootstrap script permissions ---
 RUN if [ -f "bootstrap.sh" ]; then chmod +x bootstrap.sh; fi
-
-# --- (Optional) OpenVSCode Server setup ---
-# Comment out if not needed, but fixed version included
-ARG OPENVSCODE_VERSION=v1.101.2
-RUN wget -O /tmp/openvscode-server.tar.gz \
-  "https://github.com/gitpod-io/openvscode-server/releases/download/${OPENVSCODE_VERSION}/openvscode-server-${OPENVSCODE_VERSION#v}-linux-x64.tar.gz" \
-  && tar -xzf /tmp/openvscode-server.tar.gz -C /opt \
-  && rm /tmp/openvscode-server.tar.gz \
-  && mv /opt/openvscode-server-* /opt/openvscode-server \
-  && chown -R 1000:1000 /opt/openvscode-server
 
 USER appuser
 EXPOSE 7860
