@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, threading, logging, warnings, json, time, re
+import os, threading, logging, warnings, json, time, re, asyncio
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from huggingface_hub import snapshot_download, HfApi
 from langchain_chroma import Chroma
@@ -36,23 +37,15 @@ STATE_FILE = ENV("RAG_STATE_FILE", "/data/.state.json")
 PORT = int(ENV("PORT", "7860"))
 HOST = ENV("HOST", "0.0.0.0")
 
-# --- Secret hygiene helpers (prevents 'Illegal header value' 502s) ---
-_WS = re.compile(r"\s+")  # any whitespace
+# --- Secret hygiene helpers ---
+_WS = re.compile(r"\s+")
 
 def _clean_secret(val: Optional[str], name: str) -> str:
-    """
-    Strip all whitespace (including CR/LF/tabs/non-breaking) from ends AND middle.
-    If any whitespace remains (shouldn't), reject. Ensures tokens are one contiguous string.
-    """
-    v = (val or "")
-    # remove CR/LF specifically then trim
-    v = v.replace("\r", "").replace("\n", "").strip()
-    # reject if any whitespace still inside
+    v = (val or "").replace("\r", "").replace("\n", "").strip()
     if _WS.search(v):
-        raise RuntimeError(f"{name} contains whitespace; fix your secret (paste as a single line with no spaces)")
-    # reject obvious quotes
+        raise RuntimeError(f"{name} contains whitespace; fix your secret (single-line, no spaces)")
     if v.startswith(("'", '"')) or v.endswith(("'", '"')):
-        raise RuntimeError(f"{name} appears to include quotes; remove wrapping quotes")
+        raise RuntimeError(f"{name} appears quoted; remove wrapping quotes")
     return v
 
 def _auth_header(token: str) -> Dict[str, str]:
@@ -72,7 +65,6 @@ MAX_RETRIES = int(ENV("UPSTREAM_MAX_RETRIES", "3"))
 BACKOFF_SECS = float(ENV("UPSTREAM_BACKOFF_SECS", "0.5"))
 
 def _normalize_url(u: str) -> str:
-    # ensure scheme present
     if u and not urllib.parse.urlparse(u).scheme:
         u = "https://" + u
     return u.rstrip("/")
@@ -80,7 +72,6 @@ def _normalize_url(u: str) -> str:
 HF_PRIMARY_ENDPOINT = _normalize_url(HF_PRIMARY_ENDPOINT)
 HF_FALLBACK_ENDPOINT = _normalize_url(HF_FALLBACK_ENDPOINT)
 
-# Quick redacted preview for debugging (safe)
 def _prefix(s: str) -> str:
     return (s[:6] + "***") if s else "<none>"
 
@@ -92,25 +83,29 @@ log.info("Friendli key prefix: %s", _prefix(FRIENDLI_API_KEY))
 # --- Embeddings + Vector DB ---
 embeddings = HuggingFaceBgeEmbeddings(
     model_name="BAAI/bge-small-en-v1.5",
-    encode_kwargs={"normalize_embeddings": True},  # cosine-ready vectors
+    encode_kwargs={"normalize_embeddings": True},
 )
 os.makedirs(DB_DIR, exist_ok=True)
 client = PersistentClient(path=DB_DIR)
-# global vectordb guarded by a lock for atomic swapping
 _vectordb_lock = threading.RLock()
 vectordb = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=client)
 
 def build_retriever(k: int = 4):
-    # Use MMR with a larger candidate set for better diversity
     return vectordb.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": max(20, 5 * k)})
 
-# --- Prompt ---
+# --- Prompt: ChatGPT-like direct answer ---
 prompt = ChatPromptTemplate.from_template(
-    "Use <context> to answer. If not sure, say 'I don’t know.'\n\nQ: {question}\n<context>\n{context}\n</context>"
+    "You are ISP Advisory Assistant. Write a clear, concise answer directly to the user in clean Markdown.\n"
+    "- Do NOT restate or enumerate the user's question.\n"
+    "- Avoid meta phrases like 'Based on the provided context'.\n"
+    "- Prefer short paragraphs and bullet points when helpful.\n"
+    "- If uncertain, say \"I don’t know.\" Do not fabricate.\n\n"
+    "Use <context> for facts.\n<context>\n{context}\n</context>\n\n"
+    "User question:\n{question}"
 )
 parser = StrOutputParser()
 
-# -------- Managed Endpoint Caller (HF primary + Friendli fallback) --------
+# -------- Upstream callers --------
 def _payload_openai_style(content: str) -> Dict[str, Any]:
     return {
         "model": "meta-llama/Llama-3.1-8B-Instruct",
@@ -126,7 +121,7 @@ def _payload_tgi_generate(content: str) -> Dict[str, Any]:
 def _extract_text_from_openai(resp_json: Dict[str, Any]) -> str:
     with suppress(Exception):
         return resp_json["choices"][0]["message"]["content"]
-    return json.dumps(resp_json)  # last resort
+    return json.dumps(resp_json)
 
 def _extract_text_from_tgi(resp_json: Any) -> str:
     if isinstance(resp_json, dict) and "generated_text" in resp_json:
@@ -141,7 +136,6 @@ def _http_post_with_retries(url: str, headers: Dict[str, str], json_body: Dict[s
         try:
             with httpx.Client(timeout=REQUEST_TIMEOUT) as s:
                 r = s.post(url, headers=headers, json=json_body)
-                # Treat 429/5xx as retryable
                 if r.status_code in (429, 500, 502, 503, 504):
                     raise httpx.HTTPStatusError(f"Retryable {r.status_code}", request=r.request, response=r)
                 return r
@@ -151,7 +145,6 @@ def _http_post_with_retries(url: str, headers: Dict[str, str], json_body: Dict[s
                 time.sleep(BACKOFF_SECS * attempt)
             else:
                 raise
-    # Should not reach here
     raise last_exc or RuntimeError("Unknown upstream error")
 
 def call_hf_managed(formatted_prompt: str) -> str:
@@ -159,20 +152,16 @@ def call_hf_managed(formatted_prompt: str) -> str:
         raise RuntimeError("HF_PRIMARY_ENDPOINT is not set")
     if not HF_API_TOKEN:
         raise RuntimeError("HF_API_TOKEN is not set")
-    headers = _auth_header(HF_API_TOKEN)  # sanitized, newline-free
-    # Try OpenAI-compatible first
+    headers = _auth_header(HF_API_TOKEN)
     url_chat = f"{HF_PRIMARY_ENDPOINT}/v1/chat/completions"
     try:
         r = _http_post_with_retries(url_chat, headers, _payload_openai_style(formatted_prompt))
         if r.status_code == 200:
             return _extract_text_from_openai(r.json())
-        # If not found/allowed, try TGI
         if r.status_code in (404, 405):
             raise httpx.HTTPStatusError("Switching to /generate", request=r.request, response=r)
-        # Non-OK
         raise RuntimeError(f"HF /v1/chat/completions error {r.status_code}: {r.text[:200]}")
     except Exception as e_first:
-        # Try TGI classic
         url_gen = f"{HF_PRIMARY_ENDPOINT}/generate"
         r2 = _http_post_with_retries(url_gen, headers, _payload_tgi_generate(formatted_prompt))
         if r2.status_code == 200:
@@ -184,7 +173,7 @@ def call_friendli_fallback(formatted_prompt: str) -> str:
         raise RuntimeError("HF_FALLBACK_ENDPOINT is not set")
     if not FRIENDLI_API_KEY:
         raise RuntimeError("FRIENDLI_API_KEY is not set")
-    headers = _auth_header(FRIENDLI_API_KEY)  # sanitized, newline-free
+    headers = _auth_header(FRIENDLI_API_KEY)
     path = "/v1/chat/completions" if not HF_FALLBACK_ENDPOINT.endswith("/v1/chat/completions") else ""
     url = f"{HF_FALLBACK_ENDPOINT}{path}"
     r = _http_post_with_retries(url, headers, _payload_openai_style(formatted_prompt))
@@ -193,7 +182,6 @@ def call_friendli_fallback(formatted_prompt: str) -> str:
     raise RuntimeError(f"Friendli error {r.status_code}: {r.text[:200]}")
 
 def _redact(s: str) -> str:
-    # best-effort redaction for tokens if they ever appear in upstream error strings
     if not s:
         return s
     for t in (HF_API_TOKEN, FRIENDLI_API_KEY):
@@ -203,7 +191,6 @@ def _redact(s: str) -> str:
 
 def generate_answer(question: str, context: str) -> str:
     formatted = prompt.format(question=question, context=context)
-    # Try HF primary → Friendli fallback
     try:
         return call_hf_managed(formatted)
     except Exception as e1:
@@ -212,8 +199,29 @@ def generate_answer(question: str, context: str) -> str:
             return call_friendli_fallback(formatted)
         except Exception as e2:
             log.error("Friendli fallback failed: %s", _redact(str(e2)))
-            # bubble up a redacted error
             raise RuntimeError(f"Primary & fallback failed. Primary: {str(e1)[:200]}; Fallback: {str(e2)[:200]}")
+
+# -------- Formatting helpers (ChatGPT-like) --------
+def format_like_chatgpt(text: str) -> str:
+    t = (text or "").strip()
+    t = re.sub(r'^\s*(based on (the )?provided context|from the context|according to the context)[,:\s-]*', '', t, flags=re.I)
+    t = re.sub(r'^\s*q:\s*.*?\n+', '', t, flags=re.I | re.S)
+    if re.search(r'(?:^|\n)\s*1\.\s', t) and re.search(r'(?:^|\n)\s*2\.\s', t):
+        t = re.sub(r'(?:^|\n)\s*\d+\.\s+', r'\n- ', t)
+    t = re.sub(r'(?:^|\n)\s*-\s+', lambda m: '\n- ', t)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+def dedupe_sources(docs) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for d in docs:
+        src = (d.metadata.get("source"), d.metadata.get("page"))
+        if src in seen:
+            continue
+        seen.add(src)
+        out.append({"path": src[0], "page": src[1]})
+    return out
 
 # -------- Dataset sync + indexing --------
 def sync_pdfs() -> str:
@@ -250,12 +258,10 @@ def load_docs(paths: List[str]):
     return docs
 
 def rebuild_index(docs):
-    # delete & recreate collection safely
     with suppress(Exception):
         client.delete_collection(name=COLLECTION_NAME)
     new_client = PersistentClient(path=DB_DIR)
     new_db = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=new_client)
-    # batch adds
     for i in range(0, len(docs), 32):
         new_db.add_documents(docs[i : i + 32])
     return new_db
@@ -273,7 +279,6 @@ def reindex(force: bool = False) -> Dict[str, Any]:
         docs = load_docs(pdfs)
         global vectordb
         new_db = rebuild_index(docs)
-        # atomic swap under lock
         with _vectordb_lock:
             vectordb = new_db
         with open(STATE_FILE, "w") as f:
@@ -281,8 +286,56 @@ def reindex(force: bool = False) -> Dict[str, Any]:
         return {"reindexed": True, "commit": new_sha, "docs": len(docs)}
     return {"reindexed": False, "commit": new_sha}
 
+# -------- SSE helpers (streaming) --------
+def _sse(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+async def _yield_simulated_stream(text: str):
+    chunk = []
+    chars = 0
+    for word in (text or "").split():
+        chunk.append(word)
+        chars += len(word) + 1
+        if chars >= 90:
+            yield _sse("delta", {"text": " ".join(chunk) + " "})
+            await asyncio.sleep(0.02)
+            chunk, chars = [], 0
+    if chunk:
+        yield _sse("delta", {"text": " ".join(chunk)})
+    yield _sse("done", {})
+
+async def _stream_answer_openai_style(formatted_prompt: str):
+    # Try OpenAI-compatible true streaming; fall back to simulate
+    try:
+        if not HF_PRIMARY_ENDPOINT or not HF_API_TOKEN:
+            raise RuntimeError("Primary streaming not configured")
+        headers = _auth_header(HF_API_TOKEN)
+        payload = _payload_openai_style(formatted_prompt)
+        payload["stream"] = True
+        async with httpx.AsyncClient(timeout=None) as client:
+            url = f"{HF_PRIMARY_ENDPOINT}/v1/chat/completions"
+            async with client.stream("POST", url, headers=headers, json=payload) as r:
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                        delta = obj["choices"][0].get("delta", {}).get("content", "")
+                        if delta:
+                            yield _sse("delta", {"text": delta})
+                    except Exception:
+                        continue
+            yield _sse("done", {})
+            return
+    except Exception:
+        pass
+    raise RuntimeError("no_stream")
+
 # -------- FastAPI --------
-app = FastAPI(title="Career GPT RAG API", version="1.4.0")
+app = FastAPI(title="Career GPT RAG API", version="1.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -321,9 +374,8 @@ class Ask(BaseModel):
 
 @app.post("/ask")
 def ask(q: Ask):
-    # Retrieve context
     try:
-        with _vectordb_lock:  # ensure we don't swap vectordb mid-query
+        with _vectordb_lock:
             docs = build_retriever(k=4).invoke(q.question)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Retriever error: {str(e)[:200]}")
@@ -331,17 +383,50 @@ def ask(q: Ask):
     ctx = "\n\n".join([d.page_content for d in docs])
     try:
         text = generate_answer(q.question, ctx)
-        return {
-            "answer": text,
-            "sources": [
-                {"path": d.metadata.get("source"), "page": d.metadata.get("page")}
-                for d in docs
-            ],
-        }
+        formatted = format_like_chatgpt(text)
+        sources = dedupe_sources(docs)
+        return {"answer": formatted, "sources": sources}
     except Exception as e:
-        # Clean, redacted 502 without leaking newliney tokens
         msg = _redact(str(e))[:500]
         raise HTTPException(status_code=502, detail=f"LLM upstream error: {msg}")
+
+# --- Streaming version (SSE): POST /ask_stream ---
+class AskQ(BaseModel):
+    question: str
+
+@app.post("/ask_stream")
+async def ask_stream(q: AskQ):
+    try:
+        with _vectordb_lock:
+            docs = build_retriever(k=4).invoke(q.question)
+    except Exception as e:
+        async def _err():
+            yield _sse("error", {"message": f"Retriever error: {str(e)[:200]}"})
+            yield _sse("done", {})
+        return StreamingResponse(_err(), media_type="text/event-stream", headers={"Cache-Control":"no-cache","Connection":"keep-alive"})
+
+    ctx = "\n\n".join([d.page_content for d in docs])
+    formatted_prompt = prompt.format(question=q.question, context=ctx)
+
+    async def _gen():
+        # try true upstream streaming
+        try:
+            async for evt in _stream_answer_openai_style(formatted_prompt):
+                yield evt
+            return
+        except Exception:
+            pass
+        # simulate if not supported
+        try:
+            full = generate_answer(q.question, ctx)
+            full = format_like_chatgpt(full)
+            async for evt in _yield_simulated_stream(full):
+                yield evt
+        except Exception as e:
+            yield _sse("error", {"message": _redact(str(e))[:300]})
+            yield _sse("done", {})
+
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers={"Cache-Control":"no-cache","Connection":"keep-alive"})
 
 if __name__ == "__main__":
     import uvicorn

@@ -16,13 +16,13 @@ langchain-huggingface==0.1.2
 
 # --- Embeddings / Hugging Face ---
 transformers>=4.46,<5
-torch==2.3.1+cpu        # explicitly CPU wheel
+torch==2.9.0+cpu                 # ← bump to a wheel that exists for your Python
 huggingface-hub>=0.23.1,<0.26
-numpy==1.26.4
+numpy>=2.0,<3                    # ← 1.26.x won’t install on 3.13; allow NumPy 2.x
 
 # --- Required extras ---
 pypdf>=4.2.0
-onnxruntime>=1.18.0
+onnxruntime>=1.19.2              # newer ONNXRuntime has better recent-Python support
 
 # --- Ingest helpers ---
 tqdm>=4.66
