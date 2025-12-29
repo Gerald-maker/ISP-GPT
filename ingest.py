@@ -1,701 +1,266 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Robust RAG ingestion for Chroma + Embeddings (BGE / FastEmbed / HF Local / HF Inference / Ollama)
+import os, threading, logging, warnings, json, re
+from typing import Optional, List, Dict, Any
 
-Supported file types: PDF, HTML, DOCX, TXT/MD, CSV (+ watch mode)
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-Features
-- Incremental ingest with stable chunk IDs (sha1(file|page|content)) -> no dup chunks
-- Rich metadata for citations: source, source_path, page, mtime
-- Clean/normalize text (page number + whitespace heuristics)
-- Config via CLI flags and env vars
-- Rebuild & dry-run modes, detailed logs
-- Optional watch mode (polling) for auto-reindex on file changes
-- Embeddings providers:
-    * bge          -> HuggingFaceBgeEmbeddings (no sklearn/scipy)
-    * fastembed    -> FastEmbedEmbeddings (tiny, fast)
-    * hf_local     -> sentence-transformers (may pull sklearn/scipy)
-    * hf_inference -> Hugging Face Inference API (token required)
-    * ollama       -> OllamaEmbeddings
+from huggingface_hub import snapshot_download, HfApi
+from langchain_chroma import Chroma
+from chromadb import PersistentClient
 
-BGE best practices:
-- L2 normalization (cosine space)
-- Prefix: "passage: " for docs, "query: " for queries (toggle with --no-bge-prefix)
-"""
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
 
-from __future__ import annotations
+# --------------------- Setup & Logging ---------------------
+warnings.filterwarnings("ignore")
+os.environ["ORT_LOG_SEVERITY_LEVEL"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-import argparse
-import hashlib
-import logging
-import os
-import re
-import signal
-import sys
-import time
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+log = logging.getLogger("rag_api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-import numpy as np
-from tqdm import tqdm
-from unidecode import unidecode
-
-# -------------------- Vector store --------------------
-try:
-    from langchain_chroma import Chroma
-except ImportError:
-    from langchain_community.vectorstores import Chroma  # fallback
-
-try:
-    # Newer splitters live here
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter  # fallback
-
-try:
-    from langchain_core.documents import Document
-except ImportError:
-    from langchain_community.docstore.document import Document  # fallback
-
-try:
-    from langchain_core.embeddings import Embeddings
-except ImportError:
-    from langchain.embeddings.base import Embeddings  # fallback
-
-from chromadb.config import Settings as ChromaSettings
-
-# Loaders
-from langchain_community.document_loaders import (
-    PyMuPDFLoader,   # PDF
-    BSHTMLLoader,    # HTML (BeautifulSoup)
-    Docx2txtLoader,  # DOCX
-    TextLoader,      # TXT/MD
-    CSVLoader,       # CSV
-)
-
-# Embedding impls (lazy-imported in builder too)
-from langchain_community.embeddings import (
-    HuggingFaceBgeEmbeddings,
-    FastEmbedEmbeddings,
-)
-
-# -------------------- Defaults (overridable via env) --------------------
+# --------------------- Env ---------------------
 ENV = os.getenv
-DEFAULT_DOCS_DIR = ENV("RAG_DOCS_DIR", "docs")
-DEFAULT_DB_DIR = ENV("RAG_DB_DIR", "/data/chroma_db")  # Spaces persistent storage by default
+DB_DIR = ENV("RAG_DB_DIR", "/tmp/chroma_db")
+COLLECTION_NAME = ENV("RAG_COLLECTION", "isp_rag")
+DATASET_ID = ENV("RAG_DATASET_ID", "internationalscholarsprogram/DOC")
+DATA_REV = ENV("RAG_DATASET_REVISION", "main")
+CORPUS_DIR = ENV("RAG_CORPUS_DIR", "/data/corpus")
+STATE_FILE = "/data/.state.json"
 
-# Provider: "bge" | "fastembed" | "hf_local" | "hf_inference" | "ollama"
-DEFAULT_EMBED_PROVIDER = ENV("RAG_EMBED_PROVIDER", "bge").lower()
-DEFAULT_EMBED_MODEL = ENV("RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+PORT = int(ENV("PORT", "7860"))
+HOST = "0.0.0.0"
 
-# Device for local providers
-DEFAULT_DEVICE = ENV("RAG_DEVICE", "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu")
+# Optional: protect reindex endpoint (set in HF Space secrets)
+ADMIN_REINDEX_TOKEN = ENV("ADMIN_REINDEX_TOKEN", "").strip()
 
-# HF token for hf_inference (or for gated/private models if needed)
-DEFAULT_HF_TOKEN = ENV("HUGGINGFACEHUB_API_TOKEN", ENV("HF_TOKEN", ""))
-
-DEFAULT_USE_PREFIX = ENV("RAG_BGE_PREFIX", "1") not in ("0", "false", "False")
-
-DEFAULT_CHUNK_SIZE = int(ENV("RAG_CHUNK_SIZE", "900"))
-DEFAULT_CHUNK_OVERLAP = int(ENV("RAG_CHUNK_OVERLAP", "180"))
-DEFAULT_MIN_CHARS = int(ENV("RAG_MIN_CHARS", "200"))  # drop tiny chunks
-
-DEFAULT_WATCH_INTERVAL = int(ENV("RAG_WATCH_INTERVAL", "5"))  # seconds
-DEFAULT_BATCH_SIZE = int(ENV("RAG_EMBED_BATCH", "32"))        # embedding batch size (hf_inference wrapper)
-
-# -------------------- Logging --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+# --------------------- Embeddings + Vector DB ---------------------
+# BGE recommended settings
+embeddings = HuggingFaceBgeEmbeddings(
+    model_name="BAAI/bge-small-en-v1.5",
+    encode_kwargs={"normalize_embeddings": True},
 )
-log = logging.getLogger("rag_ingest")
-for _noisy in ["httpx", "chromadb", "langchain", "asyncio"]:
-    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
-# -------------------- Helpers --------------------
-def sha1(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+os.makedirs(DB_DIR, exist_ok=True)
+client = PersistentClient(path=DB_DIR)
+vectordb = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=client)
 
-def normalize_text(txt: str) -> str:
-    """
-    Normalize/clean text for better retrieval.
-    - ascii transliteration to reduce unicode noise
-    - strip trailing spaces
-    - drop lines that are just numbers (page numbers)
-    - collapse excessive blank lines/spaces
-    """
-    if not txt:
+def build_retriever(k: int = 4):
+    return vectordb.as_retriever(search_type="mmr", search_kwargs={"k": k})
+
+# --------------------- Text cleanup ---------------------
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+def clean_text(s: str) -> str:
+    if not s:
         return ""
-    txt = unidecode(txt)
-    lines = [re.sub(r"\s+$", "", line) for line in txt.splitlines()]
-    lines = [l for l in lines if not re.fullmatch(r"\d{1,4}", l) and l.strip()]
-    txt = "\n".join(lines)
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
-    txt = re.sub(r"[ \t]{2,}", " ", txt)
-    return txt.strip()
+    s = s.replace("\r", "")
+    s = CONTROL_CHARS_RE.sub(" ", s)
+    s = re.sub(r"[ \t]+$", "", s, flags=re.M)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
-def assign_common_metadata(doc: Document, path: Path, page: Optional[int] = None) -> None:
-    doc.metadata = dict(doc.metadata or {})
-    doc.metadata["source"] = path.name
-    doc.metadata["source_path"] = str(path.resolve())
-    if page is not None and doc.metadata.get("page") is None:
-        doc.metadata["page"] = page
+# --------------------- Dataset sync + indexing ---------------------
+def sync_pdfs() -> str:
+    os.makedirs(CORPUS_DIR, exist_ok=True)
+    snapshot_download(
+        repo_id=DATASET_ID,
+        repo_type="dataset",
+        revision=DATA_REV,
+        local_dir=CORPUS_DIR,
+        local_dir_use_symlinks=False
+    )
+    info = HfApi().repo_info(repo_id=DATASET_ID, repo_type="dataset", revision=DATA_REV)
+    return info.sha
+
+def list_pdfs(root: str) -> List[str]:
+    out = []
+    for r, _, fs in os.walk(root):
+        for f in fs:
+            if f.lower().endswith(".pdf"):
+                out.append(os.path.join(r, f))
+    return out
+
+def load_docs(pdf_paths: List[str]):
+    docs = []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
+    for p in pdf_paths:
+        for pg in PyPDFLoader(p).load():
+            pg.page_content = clean_text(pg.page_content)
+            # ensure useful metadata for citations
+            pg.metadata = dict(pg.metadata or {})
+            pg.metadata["source_path"] = p
+            pg.metadata["source"] = os.path.basename(p)
+            # pg.metadata["page"] typically exists from loader
+            docs += splitter.split_documents([pg])
+    return docs
+
+def rebuild_index(docs):
+    # delete existing collection
     try:
-        doc.metadata["mtime"] = int(path.stat().st_mtime)
-    except OSError:
-        doc.metadata["mtime"] = 0
-
-def load_pdf(path: Path) -> List[Document]:
-    loader = PyMuPDFLoader(str(path))
-    docs = loader.load()
-    out: List[Document] = []
-    for d in docs:
-        d.page_content = normalize_text(d.page_content)
-        assign_common_metadata(d, path, d.metadata.get("page"))
-        if d.page_content:
-            out.append(d)
-    return out
-
-def load_html(path: Path) -> List[Document]:
-    loader = BSHTMLLoader(str(path))
-    docs = loader.load()
-    out: List[Document] = []
-    for d in docs:
-        d.page_content = normalize_text(d.page_content)
-        assign_common_metadata(d, path, None)
-        if d.page_content:
-            out.append(d)
-    return out
-
-def load_docx(path: Path) -> List[Document]:
-    loader = Docx2txtLoader(str(path))
-    docs = loader.load()
-    out: List[Document] = []
-    for d in docs:
-        d.page_content = normalize_text(d.page_content)
-        assign_common_metadata(d, path, None)
-        if d.page_content:
-            out.append(d)
-    return out
-
-def load_text_like(path: Path) -> List[Document]:
-    loader = TextLoader(str(path), autodetect_encoding=True)
-    docs = loader.load()
-    out: List[Document] = []
-    for d in docs:
-        d.page_content = normalize_text(d.page_content)
-        assign_common_metadata(d, path, None)
-        if d.page_content:
-            out.append(d)
-    return out
-
-def load_csv(path: Path) -> List[Document]:
-    """Load CSV as one Document per row, including header mapping in content."""
-    loader = CSVLoader(str(path))
-    docs = loader.load()
-    out: List[Document] = []
-    for d in docs:
-        d.page_content = normalize_text(d.page_content)
-        assign_common_metadata(d, path, None)
-        if d.page_content:
-            out.append(d)
-    return out
-
-SUPPORTED_SUFFIXES = {".pdf", ".html", ".htm", ".docx", ".txt", ".md", ".markdown", ".csv"}
-
-def discover_files(docs_dir: Path) -> List[Path]:
-    files: List[Path] = []
-    for p in docs_dir.rglob("*"):
-        if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES:
-            files.append(p)
-    return files
-
-def chunk_documents(
-    raw_docs: List[Document],
-    chunk_size: int,
-    chunk_overlap: int,
-    min_chars: int,
-) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", " ", ""],
-    )
-    chunks = splitter.split_documents(raw_docs)
-    return [c for c in chunks if len(c.page_content.strip()) >= min_chars]
-
-def make_chunk_id(doc: Document) -> str:
-    src = doc.metadata.get("source_path", doc.metadata.get("source", "unknown"))
-    page = str(doc.metadata.get("page"))
-    basis = f"{src}|{page}|{doc.page_content}"
-    return sha1(basis)
-
-def ensure_dirs(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-def batched(iterable: Iterable[Any], n: int) -> Iterable[List[Any]]:
-    batch: List[Any] = []
-    for item in iterable:
-        batch.append(item)
-        if len(batch) >= n:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-# -------------------- Embedding Adapters --------------------
-class BGEAdapter(Embeddings):
-    """Wraps any LangChain Embeddings and applies BGE prefixes."""
-    def __init__(self, base: Embeddings, use_prefixes: bool = True):
-        self.base = base
-        self.use_prefixes = use_prefixes
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        if self.use_prefixes:
-            texts = [f"passage: {t}" for t in texts]
-        return self.base.embed_documents(texts)
-
-    def embed_query(self, text: str) -> List[float]:
-        if self.use_prefixes:
-            text = f"query: {text}"
-        return self.base.embed_query(text)
-
-class HFInferenceEmbeddings(Embeddings):
-    """
-    Minimal embeddings wrapper using Hugging Face Inference API feature-extraction.
-    - Mean-pools token embeddings
-    - L2-normalizes vectors
-    """
-    def __init__(
-        self,
-        model: str,
-        token: str,
-        timeout: float = 60.0,
-        max_retries: int = 5,
-        batch_size: int = 32,
-    ):
-        from huggingface_hub import InferenceClient  # lazy import
-        if not token:
-            raise ValueError("HF Inference API requires a token. Set HUGGINGFACEHUB_API_TOKEN or --hf-token.")
-        self.client = InferenceClient(token=token, timeout=timeout)
-        self.model = model
-        self.max_retries = max_retries
-        self.batch_size = max(1, batch_size)
-
-    @staticmethod
-    def _mean_pool(mat: List[List[float]]) -> List[float]:
-        arr = np.asarray(mat, dtype=np.float32)
-        v = arr.mean(axis=0)
-        norm = np.linalg.norm(v) + 1e-12
-        return (v / norm).tolist()
-
-    def _fe(self, text: str) -> List[float]:
-        for i in range(self.max_retries):
-            try:
-                mat = self.client.feature_extraction(model=self.model, inputs=text)
-                return self._mean_pool(mat)
-            except Exception as e:
-                if i == self.max_retries - 1:
-                    raise
-                sleep_s = max(0.5, 2 ** i * 0.5)
-                log.warning(f"HF Inference backoff ({i+1}/{self.max_retries}): {e}. Sleeping {sleep_s:.1f}s")
-                time.sleep(sleep_s)
-        return []
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        out: List[List[float]] = []
-        for batch in batched(texts, self.batch_size):
-            for t in batch:
-                out.append(self._fe(t))
-        return out
-
-    def embed_query(self, text: str) -> List[float]:
-        return self._fe(text)
-
-def build_embeddings(
-    provider: str,
-    model: str,
-    device: str,
-    use_prefixes: bool,
-    hf_token: str,
-    batch_size: int,
-) -> Embeddings:
-    provider = (provider or "").lower()
-
-    if provider in ("bge", "hf_bge", "bge_small"):
-        base = HuggingFaceBgeEmbeddings(
-            model_name=model,
-            model_kwargs={"device": device},
-            encode_kwargs={"normalize_embeddings": True},
-        )
-        log.info(f"Embedding provider: BGE ({model}) on {device}")
-        return BGEAdapter(base, use_prefixes=use_prefixes)
-
-    if provider in ("fastembed", "fe"):
-        log.info("Embedding provider: FastEmbed")
-        return FastEmbedEmbeddings()
-
-    if provider == "hf_inference":
-        base = HFInferenceEmbeddings(model=model, token=hf_token, batch_size=batch_size)
-        log.info("Embedding provider: HF Inference API")
-        return BGEAdapter(base, use_prefixes=use_prefixes)
-
-    if provider == "ollama":
-        from langchain_ollama import OllamaEmbeddings  # lazy import
-        base = OllamaEmbeddings(model=model)
-        log.info("Embedding provider: Ollama")
-        return BGEAdapter(base, use_prefixes=use_prefixes)
-
-    # hf_local (sentence-transformers)
-    from langchain_community.embeddings import HuggingFaceEmbeddings  # lazy import
-    base = HuggingFaceEmbeddings(
-        model_name=model,
-        model_kwargs={"device": device},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-    log.info(f"Embedding provider: HF local (sentence-transformers) on {device}")
-    # Use prefixes automatically if model name looks like BGE
-    return BGEAdapter(base, use_prefixes=("bge" in model.lower() and use_prefixes))
-
-# -------------------- Ingest Core --------------------
-def _wipe_dir(path: Path) -> None:
-    if not path.exists():
-        return
-    for p in sorted(path.glob("**/*"), reverse=True):
-        try:
-            if p.is_file():
-                p.unlink()
-            elif p.is_dir():
-                p.rmdir()
-        except Exception as e:
-            log.debug(f"Skipping removal for {p}: {e}")
-
-def _build_vectordb(db_dir: Path, embeddings: Embeddings) -> Chroma:
-    client_settings = ChromaSettings(
-        is_persistent=True,
-        persist_directory=str(db_dir),
-        anonymized_telemetry=False,
-    )
-    return Chroma(
-        persist_directory=str(db_dir),
-        embedding_function=embeddings,
-        collection_metadata={"hnsw:space": "cosine"},
-        client_settings=client_settings,
-    )
-
-def _load_docs_for_paths(files: List[Path]) -> List[Document]:
-    loaders = {
-        ".pdf": load_pdf,
-        ".html": load_html,
-        ".htm": load_html,
-        ".docx": load_docx,
-        ".txt": load_text_like,
-        ".md": load_text_like,
-        ".markdown": load_text_like,
-        ".csv": load_csv,
-    }
-    raw_docs: List[Document] = []
-    for path in tqdm(files, desc="Loading files", unit="file"):
-        try:
-            fn = loaders.get(path.suffix.lower())
-            if fn:
-                raw_docs.extend(fn(path))
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            log.error(f"Failed to load {path}: {e}")
-    return raw_docs
-
-def ingest_once(
-    docs_dir: Path,
-    db_dir: Path,
-    embed_provider: str,
-    embed_model: str,
-    device: str,
-    use_prefixes: bool,
-    hf_token: str,
-    batch_size: int,
-    rebuild: bool = False,
-    dry_run: bool = False,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
-    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
-    min_chars: int = DEFAULT_MIN_CHARS,
-) -> Dict[str, Any]:
-
-    ensure_dirs(docs_dir)
-    ensure_dirs(db_dir)
-
-    if rebuild and not dry_run:
-        _wipe_dir(db_dir)
-        ensure_dirs(db_dir)
-        log.warning("Rebuild mode: existing DB wiped.")
-
-    log.info(f"Using embeddings: model={embed_model} provider={embed_provider}")
-    embeddings = build_embeddings(
-        provider=embed_provider,
-        model=embed_model,
-        device=device,
-        use_prefixes=use_prefixes,
-        hf_token=hf_token,
-        batch_size=batch_size,
-    )
-
-    vectordb = _build_vectordb(db_dir, embeddings)
-
-    files = discover_files(docs_dir)
-    if not files:
-        log.warning(f"No supported files found in {docs_dir.resolve()}")
-        return {"added": 0, "skipped": 0, "total_chunks": 0, "files": 0}
-
-    raw_docs = _load_docs_for_paths(files)
-    if not raw_docs:
-        log.warning("No documents loaded after parsing.")
-        return {"added": 0, "skipped": 0, "total_chunks": 0, "files": len(files)}
-
-    chunks = chunk_documents(raw_docs, chunk_size, chunk_overlap, min_chars)
-    if not chunks:
-        log.warning("No chunks produced (check chunking params / min_chars).")
-        return {"added": 0, "skipped": 0, "total_chunks": 0, "files": len(files)}
-
-    ids = [make_chunk_id(c) for c in chunks]
-
-    # Find existing ids (batched), use underlying collection to be explicit/robust
-    existing: set[str] = set()
-    for batch in batched(ids, 500):
-        try:
-            # Prefer the underlying Chroma collection to avoid wrapper differences
-            res = vectordb._collection.get(ids=batch)  # type: ignore[attr-defined]
-            if res and res.get("ids"):
-                existing.update(res["ids"])
-        except Exception:
-            # If collection or ids don't exist, just continue
-            pass
-
-    to_add_docs: List[Document] = []
-    to_add_ids: List[str] = []
-    skipped = 0
-
-    for doc, _id in zip(chunks, ids):
-        if _id in existing:
-            skipped += 1
-            continue
-        to_add_docs.append(doc)
-        to_add_ids.append(_id)
-
-    log.info(f"Total chunks: {len(chunks)} | To add: {len(to_add_docs)} | Skipped (dups): {skipped}")
-
-    if dry_run:
-        log.info("Dry-run mode: not writing to DB.")
-        return {
-            "added": len(to_add_docs),
-            "skipped": skipped,
-            "total_chunks": len(chunks),
-            "files": len(files),
-            "dry_run": True,
-        }
-
-    added = 0
-    for batch_docs, batch_ids in zip(batched(to_add_docs, 256), batched(to_add_ids, 256)):
-        try:
-            # Correct instance call (not Chroma.add_documents(...))
-            vectordb.add_documents(documents=batch_docs, ids=batch_ids)
-            added += len(batch_docs)
-        except Exception as e:
-            log.error(f"Error adding batch ({len(batch_docs)} docs): {e}")
-
-    try:
-        vectordb.persist()
-    except Exception as e:
-        log.error(f"Persist error: {e}")
-
-    return {
-        "added": added,
-        "skipped": skipped,
-        "total_chunks": len(chunks),
-        "files": len(files),
-        "db_dir": str(db_dir.resolve()),
-        "embed_model": embed_model,
-        "embed_provider": embed_provider,
-    }
-
-# -------------------- Watch Mode (polling) --------------------
-def build_mtime_index(docs_dir: Path) -> Dict[str, float]:
-    idx: Dict[str, float] = {}
-    for f in discover_files(docs_dir):
-        try:
-            idx[str(f.resolve())] = f.stat().st_mtime
-        except Exception:
-            pass
-    return idx
-
-def watch_and_ingest(
-    docs_dir: Path,
-    db_dir: Path,
-    embed_provider: str,
-    embed_model: str,
-    device: str,
-    use_prefixes: bool,
-    hf_token: str,
-    batch_size: int,
-    interval: int,
-    chunk_size: int,
-    chunk_overlap: int,
-    min_chars: int,
-) -> None:
-    log.info(f"Watching {docs_dir.resolve()} every {interval}s for changes...")
-    baseline = build_mtime_index(docs_dir)
-    while True:
-        time.sleep(interval)
-        curr = build_mtime_index(docs_dir)
-
-        added_paths = [p for p in curr.keys() if p not in baseline]
-        changed_paths = [p for p, mt in curr.items() if p in baseline and mt > baseline[p]]
-        removed_paths = [p for p in baseline.keys() if p not in curr]
-
-        if not (added_paths or changed_paths or removed_paths):
-            continue
-
-        if removed_paths:
-            log.warning(f"{len(removed_paths)} files removed since last scan (not deleting existing vectors).")
-
-        if added_paths or changed_paths:
-            log.info(f"Detected {len(added_paths)} new and {len(changed_paths)} modified files. Re-ingesting incrementally...")
-            summary = ingest_once(
-                docs_dir=Path(docs_dir),
-                db_dir=Path(db_dir),
-                embed_provider=embed_provider,
-                embed_model=embed_model,
-                device=device,
-                use_prefixes=use_prefixes,
-                hf_token=hf_token,
-                batch_size=batch_size,
-                rebuild=False,
-                dry_run=False,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                min_chars=min_chars,
-            )
-            log.info(f"Watch ingest summary: {summary}")
-
-        baseline = curr
-
-# -------------------- CLI --------------------
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Ingest documents (PDF/HTML/DOCX/TXT/MD/CSV) into Chroma for RAG.")
-    # I/O
-    p.add_argument("--docs", default=DEFAULT_DOCS_DIR, help=f"Docs directory (default: {DEFAULT_DOCS_DIR})")
-    p.add_argument("--db", default=DEFAULT_DB_DIR, help=f"Chroma DB directory (default: {DEFAULT_DB_DIR})")
-
-    # Embeddings
-    p.add_argument("--embed-provider", default=DEFAULT_EMBED_PROVIDER,
-                   choices=["bge", "fastembed", "hf_local", "hf_inference", "ollama"],
-                   help=f"Embedding provider (default: {DEFAULT_EMBED_PROVIDER})")
-    p.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL,
-                   help=f"Embedding model name (default: {DEFAULT_EMBED_MODEL})")
-    p.add_argument("--device", default=DEFAULT_DEVICE, help=f"'cpu' or 'cuda' (local providers, default: {DEFAULT_DEVICE})")
-    p.add_argument("--hf-token", default=DEFAULT_HF_TOKEN, help="HF token (hf_inference or gated/private models)")
-    p.add_argument("--no-bge-prefix", action="store_true", help="Disable 'passage:/query:' prefixes for embeddings")
-    p.add_argument("--embed-batch", type=int, default=DEFAULT_BATCH_SIZE, help=f"Embedding batch size (hf_inference): default {DEFAULT_BATCH_SIZE}")
-
-    # Ingest
-    p.add_argument("--rebuild", action="store_true", help="Wipe and rebuild the DB")
-    p.add_argument("--dry-run", action="store_true", help="Do everything except write to DB")
-    p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help=f"Chunk size (default: {DEFAULT_CHUNK_SIZE})")
-    p.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP, help=f"Chunk overlap (default: {DEFAULT_CHUNK_OVERLAP})")
-    p.add_argument("--min-chars", type=int, default=DEFAULT_MIN_CHARS, help=f"Drop chunks shorter than this (default: {DEFAULT_MIN_CHARS})")
-
-    # Watch
-    p.add_argument("--watch", action="store_true", help="Watch for file changes and ingest incrementally (polling)")
-    p.add_argument("--interval", type=int, default=DEFAULT_WATCH_INTERVAL, help=f"Watch poll interval seconds (default: {DEFAULT_WATCH_INTERVAL})")
-    return p.parse_args()
-
-def _install_signal_handlers() -> None:
-    def _handler(signum, _frame):
-        names = {signal.SIGINT: "SIGINT", signal.SIGTERM: "SIGTERM"}
-        log.warning(f"Received {names.get(signum, signum)}. Exiting gracefully...")
-        sys.exit(130 if signum == signal.SIGINT else 143)
-
-    try:
-        signal.signal(signal.SIGINT, _handler)
-        signal.signal(signal.SIGTERM, _handler)
+        client.delete_collection(COLLECTION_NAME)
     except Exception:
-        # Not all environments allow signal hooks (e.g., Windows threads)
         pass
 
-def main() -> None:
-    _install_signal_handlers()
-    args = parse_args()
-    docs_dir = Path(args.docs)
-    db_dir = Path(args.db)
+    new_client = PersistentClient(path=DB_DIR)
+    new_db = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, client=new_client)
 
-    use_prefixes = not args.no_bge_prefix
+    for i in range(0, len(docs), 32):
+        new_db.add_documents(docs[i:i+32])
 
-    log.info(f"Docs dir: {docs_dir.resolve()}")
-    log.info(f"DB dir:   {db_dir.resolve()}")
-    log.info(f"Embed:    provider={args.embed_provider} model={args.embed_model}")
+    return new_db
+
+def reindex(force: bool = False) -> Dict[str, Any]:
+    os.makedirs(CORPUS_DIR, exist_ok=True)
+    new_sha = sync_pdfs()
+
+    old_sha = None
+    if os.path.exists(STATE_FILE):
+        try:
+            old_sha = json.load(open(STATE_FILE, "r"))["dataset_sha"]
+        except Exception:
+            old_sha = None
+
+    if force or new_sha != old_sha:
+        pdfs = list_pdfs(CORPUS_DIR)
+        docs = load_docs(pdfs)
+
+        global vectordb
+        vectordb = rebuild_index(docs)
+
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        json.dump({"dataset_sha": new_sha}, open(STATE_FILE, "w"))
+
+        return {"reindexed": True, "commit": new_sha, "chunks": len(docs), "pdfs": len(pdfs)}
+
+    return {"reindexed": False, "commit": new_sha}
+
+# --------------------- FastAPI app ---------------------
+app = FastAPI(title="ISP Retriever API (RAG only)", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+INDEX_STATUS = {"state": "idle", "detail": "", "last_commit": None}
+
+def warmup():
+    global INDEX_STATUS
+    try:
+        INDEX_STATUS.update({"state": "syncing", "detail": "starting"})
+        info = reindex(force=False)
+        INDEX_STATUS.update({"state": "ready", "detail": str(info), "last_commit": info.get("commit")})
+        log.info(f"Index ready {info}")
+    except Exception as e:
+        INDEX_STATUS.update({"state": "error", "detail": str(e)})
+        log.exception("Index warmup failed")
+
+@app.on_event("startup")
+def _startup():
+    threading.Thread(target=warmup, daemon=True).start()
+
+# --------------------- Schemas ---------------------
+class AskIn(BaseModel):
+    question: Optional[str] = None
+    query: Optional[str] = None
+    k: Optional[int] = 4
+
+    @property
+    def text(self) -> str:
+        t = (self.question or self.query or "").strip()
+        t = clean_text(t)
+        if not t:
+            raise ValueError("Provide 'question' or 'query'.")
+        return t
+
+class SourceOut(BaseModel):
+    source: str
+    source_path: str
+    page: Optional[int] = None
+    snippet: str
+
+class AskOut(BaseModel):
+    question: str
+    context: str
+    sources: List[SourceOut]
+
+# --------------------- Routes ---------------------
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "config": {
+            "dataset_id": DATASET_ID,
+            "dataset_rev": DATA_REV,
+            "collection": COLLECTION_NAME,
+            "db_dir": DB_DIR,
+            "corpus_dir": CORPUS_DIR,
+            "index_status": INDEX_STATUS,
+            "reindex_protected": bool(ADMIN_REINDEX_TOKEN),
+        }
+    }
+
+@app.post("/ask", response_model=AskOut)
+def ask(payload: AskIn):
+    # Retrieval only (NO LLM generation here)
+    try:
+        k = int(payload.k or 4)
+        k = max(1, min(k, 12))
+        docs = build_retriever(k).invoke(payload.text)
+
+        # Build context string
+        ctx_parts = []
+        sources: List[SourceOut] = []
+
+        for d in docs:
+            text = clean_text(d.page_content)
+            if not text:
+                continue
+            ctx_parts.append(text)
+
+            md = d.metadata or {}
+            sources.append(SourceOut(
+                source=str(md.get("source", "")),
+                source_path=str(md.get("source_path", "")),
+                page=md.get("page", None),
+                snippet=(text[:300] + "…") if len(text) > 300 else text
+            ))
+
+        context = "\n\n---\n\n".join(ctx_parts).strip()
+
+        return AskOut(
+            question=payload.text,
+            context=context,
+            sources=sources
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Retriever error: {str(e)[:500]}")
+
+@app.post("/reindex")
+def reindex_route(
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+    force: Optional[bool] = True
+):
+    # Optional protection
+    if ADMIN_REINDEX_TOKEN:
+        if not x_admin_token or x_admin_token.strip() != ADMIN_REINDEX_TOKEN:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        if args.watch:
-            # Prime the DB once before watching
-            summary = ingest_once(
-                docs_dir=docs_dir,
-                db_dir=db_dir,
-                embed_provider=args.embed_provider,
-                embed_model=args.embed_model,
-                device=args.device,
-                use_prefixes=use_prefixes,
-                hf_token=args.hf_token,
-                batch_size=args.embed_batch,
-                rebuild=args.rebuild,
-                dry_run=args.dry_run,
-                chunk_size=args.chunk_size,
-                chunk_overlap=args.chunk_overlap,
-                min_chars=args.min_chars,
-            )
-            log.info(f"Initial ingest summary: {summary}")
-            if args.dry_run:
-                log.info("Dry-run set; skipping watch loop.")
-                return
-            watch_and_ingest(
-                docs_dir=docs_dir,
-                db_dir=db_dir,
-                embed_provider=args.embed_provider,
-                embed_model=args.embed_model,
-                device=args.device,
-                use_prefixes=use_prefixes,
-                hf_token=args.hf_token,
-                batch_size=args.embed_batch,
-                interval=args.interval,
-                chunk_size=args.chunk_size,
-                chunk_overlap=args.chunk_overlap,
-                min_chars=args.min_chars,
-            )
-        else:
-            summary = ingest_once(
-                docs_dir=docs_dir,
-                db_dir=db_dir,
-                embed_provider=args.embed_provider,
-                embed_model=args.embed_model,
-                device=args.device,
-                use_prefixes=use_prefixes,
-                hf_token=args.hf_token,
-                batch_size=args.embed_batch,
-                rebuild=args.rebuild,
-                dry_run=args.dry_run,
-                chunk_size=args.chunk_size,
-                chunk_overlap=args.chunk_overlap,
-                min_chars=args.min_chars,
-            )
-            log.info(f"Ingest summary: {summary}")
-    except KeyboardInterrupt:
-        log.warning("Interrupted.")
-        sys.exit(130)
-    except Exception:
-        log.exception("Ingest failed")
-        sys.exit(1)
+        info = reindex(force=bool(force))
+        INDEX_STATUS.update({"state": "ready", "detail": str(info), "last_commit": info.get("commit")})
+        return {"ok": True, "info": info}
+    except Exception as e:
+        INDEX_STATUS.update({"state": "error", "detail": str(e)})
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {str(e)[:500]}")
 
-
+# --------------------- Entrypoint ---------------------
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host=HOST, port=PORT)
