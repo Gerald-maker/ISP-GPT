@@ -10,12 +10,6 @@ license: mit
 
 # Career Advisory GPT 🎓🤖
 
-## Overview
-Career Advisory GPT is an AI-powered advisory system developed for **ISP ChatGPT**.  
-It helps students choose an optimal **Master’s (MS) program** based on their background, interests, and goals, and provides assistant-style Q&A from a structured knowledge base.
-
----
-
 ## ✨ Features
 - 🔍 **MS Program Recommendation** – tailored suggestions from student profiles  
 - 📚 **Knowledge Base Q&A** – career & study guidance via AI  
